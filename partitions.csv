@@ -1,0 +1,3 @@
+# Name,    Type, SubType,         Offset,   Size
+factory,   app,  factory,         0x10000,  1M
+model,     data, spiffs,                 ,  3008K
