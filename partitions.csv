@@ -1,3 +1,5 @@
-# Name,    Type, SubType,         Offset,   Size
-factory,   app,  factory,         0x10000,  1M
-model,     data, spiffs,                 ,  3008K
+# Name,     Type,  SubType, Offset,    Size
+nvs,        data,  nvs,     0x9000,    0x6000
+phy,        data,  phy,     0xF000,    0x1000
+factory,    app,   factory, 0x10000,   1M
+model,      data,  spiffs,  0x110000,  3008K

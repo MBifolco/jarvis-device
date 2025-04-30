@@ -13,6 +13,9 @@
 #include "driver/i2s.h"
 #include "driver/gpio.h"
 
+#include "esp_nimble_hci.h"
+#include "bluetooth.h"
+
 static const char *TAG = "wakeword";
 static TaskHandle_t feed_handle = NULL;
 
@@ -185,6 +188,10 @@ void app_main(void)
     i2s_mic_init();
     i2s_play_init();
 
+    ESP_LOGI(TAG, "Init Bluetooth...");
+    bluetooth_init();
+
+    
     ESP_LOGI(TAG, "Init AFE+WakeNet...");
     srmodel_list_t *models = esp_srmodel_init("model");
     if (!models) {
