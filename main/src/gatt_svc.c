@@ -14,12 +14,11 @@ static int chr_access(uint16_t conn_handle, uint16_t attr_handle,
 
 
 /* Private variables */
-static const ble_uuid16_t svc_uuid = BLE_UUID16_INIT(0x180D);
 
 static uint16_t chr_val_handle;
-static const ble_uuid16_t chr_uuid = BLE_UUID16_INIT(0x2A37);
 
 static uint16_t chr_conn_handle = 0;
+static uint16_t wake_chr_handle;
 static bool handle_inited = false;
 static bool ind_status = false;
 
@@ -27,13 +26,23 @@ static bool ind_status = false;
 static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
 
     {.type = BLE_GATT_SVC_TYPE_PRIMARY,
-     .uuid = &svc_uuid.u,
+     .uuid = BLE_UUID128_DECLARE(
+        0x01,0x23,0x45,0x67,
+        0x89,0xAB,0xCD,0xEF,
+        0x10,0x32,0x54,0x76,
+        0x98,0xBA,0xDC,0xFE
+    ),
      .characteristics =
          (struct ble_gatt_chr_def[]){
              {
-              .uuid = &chr_uuid.u,
+              .uuid = BLE_UUID128_DECLARE(
+                0xFE,0xDC,0xBA,0x98,
+                0x76,0x54,0x32,0x10,
+                0xEF,0xCD,0xAB,0x89,
+                0x67,0x45,0x23,0x01
+            ),
               .access_cb = chr_access,
-              .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_INDICATE,
+              .flags = BLE_GATT_CHR_F_NOTIFY,
               .val_handle = &chr_val_handle},
              {
                  0, /* No more characteristics in this service. */
@@ -153,6 +162,19 @@ void gatt_svr_subscribe_cb(struct ble_gap_event *event) {
         ind_status = event->subscribe.cur_indicate;
     }
 }
+
+// Call this when your wake-word engine fires
+esp_err_t gatt_svc_notify_wake(void)
+{
+    if (chr_conn_handle == 0) {
+        ESP_LOGW(TAG, "No BLE client connected; skipping notify");
+        return ESP_FAIL;
+    }
+    ble_gatts_chr_updated(wake_chr_handle);
+    ESP_LOGI(TAG, "Wake-word notification sent");
+    return ESP_OK;
+}
+
 
 /*
  *  GATT server initialization

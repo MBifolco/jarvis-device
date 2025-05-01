@@ -15,6 +15,7 @@
 
 #include "esp_nimble_hci.h"
 #include "bluetooth.h"
+#include "gatt_svc.h"
 
 static const char *TAG = "wakeword";
 static TaskHandle_t feed_handle = NULL;
@@ -130,6 +131,9 @@ static void fetch_task(void *arg)
                          res->wakenet_model_index);
                     
                 vTaskSuspend(feed_handle);
+
+                gatt_svc_notify_wake();
+                ESP_LOGI(TAG, "Wake word notification sent");
 
                 // allocate stereo buffer then a mono buffer
                 int total_samples = POST_WAKE_SECONDS * 16000;
