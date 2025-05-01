@@ -17,6 +17,7 @@
 #include "bluetooth.h"
 #include "gatt_svc.h"
 #include "audio_tone.h"
+#include "audio_tx.h"
 
 static const char *TAG = "wakeword";
 static TaskHandle_t feed_handle = NULL;
@@ -168,7 +169,12 @@ static void fetch_task(void *arg)
                     mono[i] = stereo[i * channels];                                                                                                                                                                                                                                                                                                                                                             
                 }
                 free(stereo);
-
+                
+                // send to phone
+                ESP_LOGI(TAG, "Sending %u bytes to phone…", captured * sizeof(int16_t));
+                audio_tx_send((const uint8_t *)mono, captured * sizeof(int16_t));
+                ESP_LOGI(TAG, "Sent %u bytes to phone", captured * sizeof(int16_t));
+                
                 // playback mono buffer
                 size_t written;
                 esp_err_t err = i2s_write(I2S_SPK_PORT, mono,

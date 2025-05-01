@@ -17,41 +17,57 @@ static int chr_access(uint16_t conn_handle, uint16_t attr_handle,
 
 static uint16_t chr_val_handle;
 
-static uint16_t chr_conn_handle = 0;
-static uint16_t wake_chr_handle;
+uint16_t chr_conn_handle = 0;
+uint16_t wake_chr_handle;
+uint16_t audio_chr_handle;
 static bool handle_inited = false;
 static bool ind_status = false;
 
 /* GATT services table */
 static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
-
-    {.type = BLE_GATT_SVC_TYPE_PRIMARY,
-     .uuid = BLE_UUID128_DECLARE(
-        0x01,0x23,0x45,0x67,
-        0x89,0xAB,0xCD,0xEF,
-        0x10,0x32,0x54,0x76,
-        0x98,0xBA,0xDC,0xFE
-    ),
-     .characteristics =
-         (struct ble_gatt_chr_def[]){
-             {
-              .uuid = BLE_UUID128_DECLARE(
-                0xFE,0xDC,0xBA,0x98,
-                0x76,0x54,0x32,0x10,
-                0xEF,0xCD,0xAB,0x89,
-                0x67,0x45,0x23,0x01
-            ),
-              .access_cb = chr_access,
-              .flags = BLE_GATT_CHR_F_NOTIFY,
-              .val_handle = &chr_val_handle},
-             {
-                 0, /* No more characteristics in this service. */
-             }}},
-
     {
-        0, /* No more services. */
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = BLE_UUID128_DECLARE(
+            0x01,0x23,0x45,0x67,
+            0x89,0xAB,0xCD,0xEF,
+            0x10,0x32,0x54,0x76,
+            0x98,0xBA,0xDC,0xFE
+        ),
+        .characteristics = (struct ble_gatt_chr_def[]) {
+            {
+                // Wake-word notify characteristic
+                .uuid = BLE_UUID128_DECLARE(
+                    0xFE,0xDC,0xBA,0x98,
+                    0x76,0x54,0x32,0x10,
+                    0xEF,0xCD,0xAB,0x89,
+                    0x67,0x45,0x23,0x01
+                ),
+                .access_cb  = chr_access,  // Or NULL if unused
+                .flags      = BLE_GATT_CHR_F_NOTIFY,
+                .val_handle = &wake_chr_handle,
+            },
+            {
+                // Audio data stream characteristic
+                .uuid = BLE_UUID128_DECLARE(
+                    0xAA,0xBB,0xCC,0xDD,
+                    0xEE,0xFF,0x00,0x11,
+                    0x22,0x33,0x44,0x55,
+                    0x66,0x77,0x88,0x99
+                ),
+                .access_cb  = chr_access,  // Or NULL if unused
+                .flags      = BLE_GATT_CHR_F_NOTIFY,
+                .val_handle = &audio_chr_handle,
+            },
+            {
+                0  // End of characteristic list
+            }
+        }
     },
+    {
+        0  // End of service list
+    }
 };
+
 
 /* Private functions */
 static int chr_access(uint16_t conn_handle, uint16_t attr_handle,
@@ -132,9 +148,20 @@ void gatt_svr_register_cb(struct ble_gatt_register_ctxt *ctxt, void *arg) {
             0x67,0x45,0x23,0x01
         );
 
+        static const ble_uuid128_t audio_uuid = BLE_UUID128_INIT(
+            0xAA,0xBB,0xCC,0xDD,
+            0xEE,0xFF,0x00,0x11,
+            0x22,0x33,0x44,0x55,
+            0x66,0x77,0x88,0x99
+        );
+
         if (ble_uuid_cmp(ctxt->chr.chr_def->uuid, &wake_uuid.u) == 0) {
             wake_chr_handle = ctxt->chr.val_handle;
             ESP_LOGI(TAG, "Saved wake_chr_handle = %d", wake_chr_handle);
+        }
+        if (ble_uuid_cmp(ctxt->chr.chr_def->uuid, &audio_uuid.u) == 0) {
+            audio_chr_handle = ctxt->chr.val_handle;
+            ESP_LOGI(TAG, "Saved audio_chr_handle = %d", audio_chr_handle);
         }
         break;
 
