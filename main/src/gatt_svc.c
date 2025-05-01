@@ -124,6 +124,18 @@ void gatt_svr_register_cb(struct ble_gatt_register_ctxt *ctxt, void *arg) {
                  "def_handle=%d val_handle=%d",
                  ble_uuid_to_str(ctxt->chr.chr_def->uuid, buf),
                  ctxt->chr.def_handle, ctxt->chr.val_handle);
+        // Match against your known wake-word characteristic UUID
+        static const ble_uuid128_t wake_uuid = BLE_UUID128_INIT(
+            0xFE,0xDC,0xBA,0x98,
+            0x76,0x54,0x32,0x10,
+            0xEF,0xCD,0xAB,0x89,
+            0x67,0x45,0x23,0x01
+        );
+
+        if (ble_uuid_cmp(ctxt->chr.chr_def->uuid, &wake_uuid.u) == 0) {
+            wake_chr_handle = ctxt->chr.val_handle;
+            ESP_LOGI(TAG, "Saved wake_chr_handle = %d", wake_chr_handle);
+        }
         break;
 
     /* Descriptor register event */

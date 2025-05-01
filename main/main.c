@@ -16,6 +16,7 @@
 #include "esp_nimble_hci.h"
 #include "bluetooth.h"
 #include "gatt_svc.h"
+#include "audio_tone.h"
 
 static const char *TAG = "wakeword";
 static TaskHandle_t feed_handle = NULL;
@@ -131,9 +132,11 @@ static void fetch_task(void *arg)
                          res->wakenet_model_index);
                     
                 vTaskSuspend(feed_handle);
+                tone_play(1000, 100, 50);
 
                 gatt_svc_notify_wake();
                 ESP_LOGI(TAG, "Wake word notification sent");
+                tone_play(1500, 80, 60);
 
                 // allocate stereo buffer then a mono buffer
                 int total_samples = POST_WAKE_SECONDS * 16000;
@@ -162,7 +165,7 @@ static void fetch_task(void *arg)
 
                 // pull out LEFT channel (mic) only
                 for (size_t i = 0; i < captured; i++) {
-                    mono[i] = stereo[i * channels];
+                    mono[i] = stereo[i * channels];                                                                                                                                                                                                                                                                                                                                                             
                 }
                 free(stereo);
 
@@ -191,6 +194,7 @@ void app_main(void)
     ESP_LOGI(TAG, "Init I2S...");
     i2s_mic_init();
     i2s_play_init();
+    tone_set_i2s_port(I2S_SPK_PORT);
 
     ESP_LOGI(TAG, "Init Bluetooth...");
     bluetooth_init();

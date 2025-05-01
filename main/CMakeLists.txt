@@ -1,4 +1,4 @@
-file(GLOB_RECURSE srcs "main.c" "bluetooth.c" "src/*.c")
+file(GLOB_RECURSE srcs "main.c" "bluetooth.c" "audio_tone.c" "src/*.c")
 
 idf_component_register(
     SRCS 
