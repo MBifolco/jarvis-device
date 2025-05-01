@@ -6,7 +6,7 @@
 /* Includes */
 #include "gatt_svc.h"
 #include "common.h"
-
+#include "os/os_mbuf.h"
 
 /* Private function declarations */
 static int chr_access(uint16_t conn_handle, uint16_t attr_handle,
@@ -170,8 +170,21 @@ esp_err_t gatt_svc_notify_wake(void)
         ESP_LOGW(TAG, "No BLE client connected; skipping notify");
         return ESP_FAIL;
     }
-    ble_gatts_chr_updated(wake_chr_handle);
-    ESP_LOGI(TAG, "Wake-word notification sent");
+
+    const char *msg = "awake";
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(msg, strlen(msg));
+    if (!om) {
+        ESP_LOGE(TAG, "Failed to allocate mbuf");
+        return ESP_FAIL;
+    }
+
+    int rc = ble_gatts_notify_custom(chr_conn_handle, wake_chr_handle, om);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Notify failed; rc=%d", rc);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Wake-word notification sent (msg='%s')", msg);
     return ESP_OK;
 }
 
