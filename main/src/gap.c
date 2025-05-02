@@ -173,6 +173,7 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
                     rc);
                 return rc;
             }
+            gatt_svc_gap_event_cb(event);
         }
         /* Connection failed, restart advertising */
         else {
@@ -185,7 +186,8 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
         /* A connection was terminated, print connection descriptor */
         ESP_LOGI(TAG, "disconnected from peer; reason=%d",
                  event->disconnect.reason);
-
+        
+        gatt_svc_gap_event_cb(event);
         /* Restart advertising */
         start_advertising();
         return rc;
@@ -240,6 +242,7 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
 
         /* GATT subscribe event callback */
         gatt_svr_subscribe_cb(event);
+        gatt_svc_gap_event_cb(event);
         return rc;
 
     /* MTU update event */

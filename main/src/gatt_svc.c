@@ -227,6 +227,21 @@ esp_err_t gatt_svc_notify_wake(void)
     return ESP_OK;
 }
 
+void gatt_svc_gap_event_cb(const struct ble_gap_event *event)
+{
+    if (event->type == BLE_GAP_EVENT_CONNECT &&
+        event->connect.status == 0) {
+        chr_conn_handle = event->connect.conn_handle;
+        ESP_LOGI(TAG, "Stored conn_handle=%d", chr_conn_handle);
+    } else if (event->type == BLE_GAP_EVENT_DISCONNECT) {
+        chr_conn_handle = 0;
+        ESP_LOGI(TAG, "Cleared conn_handle on disconnect");
+    } else if (event->type == BLE_GAP_EVENT_SUBSCRIBE) {
+        ESP_LOGI(TAG, "Subscribe: conn=%d attr=%d",
+                 event->subscribe.conn_handle,
+                 event->subscribe.attr_handle);
+    }
+}
 
 /*
  *  GATT server initialization
