@@ -18,6 +18,7 @@
 #include "gatt_svc.h"
 #include "audio_tone.h"
 #include "audio_tx.h"
+#include "l2cap_stream.h"
 
 static const char *TAG = "wakeword";
 static TaskHandle_t feed_handle = NULL;
@@ -172,7 +173,8 @@ static void fetch_task(void *arg)
                 
                 // send to phone
                 ESP_LOGI(TAG, "Sending %u bytes to phone…", captured * sizeof(int16_t));
-                audio_tx_send((const uint8_t *)mono, captured * sizeof(int16_t));
+                //audio_tx_send((const uint8_t *)mono, captured * sizeof(int16_t));
+                l2cap_stream_send((const uint8_t *)mono, captured * sizeof(int16_t));
                 ESP_LOGI(TAG, "Sent %u bytes to phone", captured * sizeof(int16_t));
                 
                 // playback mono buffer

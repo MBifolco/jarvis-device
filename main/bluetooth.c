@@ -95,6 +95,12 @@ void bluetooth_init(void) {
         return;
     }
 
+    rc = l2cap_stream_init();
+    if (rc != 0) {
+        ESP_LOGE(TAG, "failed to initialize L2CAP stream, error code: %d", rc);
+        return;
+    }
+
     /* NimBLE host configuration initialization */
     nimble_host_config_init();
 
