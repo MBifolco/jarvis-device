@@ -53,15 +53,10 @@ static void nimble_host_task(void *param) {
 }
 
 void bluetooth_init(void) {
-    /* Local variables */
     int rc;
     esp_err_t ret;
 
- 
-    /*
-     * NVS flash initialization
-     * Dependency of BLE stack to store configurations
-     */
+    // 1) NVS flash init (BLE needs this)
     ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
         ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -69,43 +64,59 @@ void bluetooth_init(void) {
         ret = nvs_flash_init();
     }
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "failed to initialize nvs flash, error code: %d ", ret);
+        ESP_LOGE(TAG, "NVS init failed: %d", ret);
         return;
     }
 
-    /* NimBLE stack initialization */
+    // 2) NimBLE stack init
     ret = nimble_port_init();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "failed to initialize nimble stack, error code: %d ",
-                 ret);
+        ESP_LOGE(TAG, "NimBLE init failed: %d", ret);
         return;
     }
 
-    /* GAP service initialization */
+    // 3) GAP (advertising) setup
     rc = gap_init();
     if (rc != 0) {
-        ESP_LOGE(TAG, "failed to initialize GAP service, error code: %d", rc);
+        ESP_LOGE(TAG, "GAP init failed: %d", rc);
         return;
     }
 
-    /* GATT server initialization */
+    // 4) GATT server setup (for wake notification)
     rc = gatt_svc_init();
     if (rc != 0) {
-        ESP_LOGE(TAG, "failed to initialize GATT server, error code: %d", rc);
+        ESP_LOGE(TAG, "GATT svc init failed: %d", rc);
         return;
     }
 
-    rc = l2cap_stream_init();
-    if (rc != 0) {
-        ESP_LOGE(TAG, "failed to initialize L2CAP stream, error code: %d", rc);
-        return;
+    // 5) L2CAP CoC server setup (audio streaming)
+    {
+        struct ble_l2cap_chan_cfg cfg = {0};
+        cfg.sc_mtu           = AUDIO_L2CAP_MTU;
+        cfg.sc_my_rx.credits      = AUDIO_L2CAP_INITIAL_CREDITS;
+        cfg.sc_my_rx.credit_thresh = AUDIO_L2CAP_MTU * 2;
+        cfg.sc_my_rx.flow_control  = BLE_L2CC_RX_FLOW_CTRL;
+
+        rc = ble_l2cap_accept_connection(
+                AUDIO_L2CAP_PSM,
+                &cfg,
+                l2cap_rx_cb,
+                &l2cap_chan_arg
+        );
+        if (rc != 0) {
+            ESP_LOGE(TAG, "L2CAP accept failed: %d", rc);
+            return;
+        }
     }
 
-    /* NimBLE host configuration initialization */
+    // 6) Host configuration & task
     nimble_host_config_init();
-
-    /* Start NimBLE host task thread and return */
-    xTaskCreate(nimble_host_task, "NimBLE Host", 4*1024, NULL, 5, NULL);
-    //xTaskCreate(heart_rate_task, "Heart Rate", 4*1024, NULL, 5, NULL);
-    return;
+    xTaskCreate(
+        nimble_host_task,
+        "NimBLE Host",
+        4 * 1024,
+        NULL,
+        5,
+        NULL
+    );
 }
