@@ -3,7 +3,7 @@
 #include "common.h"
 #include "gap.h"
 #include "gatt_svc.h"
-
+#include "l2cap_stream.h"
 
 /* Library function declarations */
 void ble_store_config_init(void);
