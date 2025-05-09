@@ -34,4 +34,9 @@
 #define TAG "Jarvis-BLE"
 #define DEVICE_NAME "Jarvis"
 
+// User-defined PSM for our audio channel
+#define AUDIO_L2CAP_PSM            0x0085
+#define AUDIO_L2CAP_MTU            512  // adjust as needed
+#define AUDIO_L2CAP_INITIAL_CREDITS  4
+
 #endif // COMMON_H
