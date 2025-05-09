@@ -1,57 +1,43 @@
-// l2cap_stream.c
-
 #include "l2cap_stream.h"
-#include "common.h"            // for AUDIO_L2CAP_PSM, AUDIO_L2CAP_MTU, etc.
+#include "common.h"
 #include "esp_log.h"
 #include "host/ble_l2cap.h"
 #include "os/os_mbuf.h"
 
+#undef TAG
 #define TAG "L2CAP"
 
-static struct ble_l2cap_chan *audio_chan = NULL;
-static uint16_t      local_credits = AUDIO_L2CAP_INITIAL_CREDITS;
+#define MIN(a,b) (((a) < (b)) ? (a) : (b))
 
-/**
- * L2CAP event callback: handles connection, disconnection, and received data.
- */
+static struct ble_l2cap_chan *audio_chan = NULL;
+
+// L2CAP event handler
 static int l2cap_event_cb(struct ble_l2cap_event *event, void *arg)
 {
     switch (event->type) {
         case BLE_L2CAP_EVENT_COC_CONNECTED:
-            ESP_LOGI(TAG, "L2CAP channel connected (cid=%u)",
-                     event->connect.chan->chan_id);
+            ESP_LOGI(TAG, "L2CAP connected");
             audio_chan = event->connect.chan;
-            // Send initial credits to peer
-            ble_l2cap_credits_pending(audio_chan->chan_id, AUDIO_L2CAP_INITIAL_CREDITS);
-            local_credits = AUDIO_L2CAP_INITIAL_CREDITS;
             break;
 
         case BLE_L2CAP_EVENT_COC_DISCONNECTED:
-            ESP_LOGI(TAG, "L2CAP channel disconnected (cid=%u)",
-                     event->disconnect.chan->chan_id);
+            ESP_LOGI(TAG, "L2CAP disconnected");
             audio_chan = NULL;
             break;
 
         case BLE_L2CAP_EVENT_COC_DATA_RECEIVED:
-            {
-                int len = OS_MBUF_PKTLEN(event->receive.sdu_rx);
-                ESP_LOGI(TAG, "Received %d bytes via L2CAP (discarded)", len);
-                os_mbuf_free_chain(event->receive.sdu_rx);
-                // Replenish credits so peer can keep sending if needed
-                ble_l2cap_credits_pending(audio_chan->chan_id, 1);
-            }
+            ESP_LOGI(TAG, "Received %u bytes (discarded)",
+                     (unsigned)OS_MBUF_PKTLEN(event->receive.sdu_rx));
+            os_mbuf_free_chain(event->receive.sdu_rx);
             break;
 
         default:
-            ESP_LOGW(TAG, "Unhandled L2CAP event: %d", event->type);
+            ESP_LOGW(TAG, "Unhandled event %d", event->type);
             break;
     }
     return 0;
 }
 
-/**
- * Initialize the L2CAP CoC server on our AUDIO_L2CAP_PSM.
- */
 esp_err_t l2cap_stream_init(void)
 {
     int rc = ble_l2cap_create_server(
@@ -60,24 +46,24 @@ esp_err_t l2cap_stream_init(void)
         l2cap_event_cb,
         NULL
     );
-    if (rc != 0) {
-        ESP_LOGE(TAG, "Failed to create L2CAP server on PSM 0x%04X; rc=%d",
-                 AUDIO_L2CAP_PSM, rc);
+    if (rc) {
+        ESP_LOGE(TAG, "ble_l2cap_create_server rc=%d", rc);
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "L2CAP CoC server registered on PSM 0x%04X, MTU=%d",
+    ESP_LOGI(TAG, "L2CAP server PSM=0x%04X MTU=%d",
              AUDIO_L2CAP_PSM, AUDIO_L2CAP_MTU);
     return ESP_OK;
 }
 
-/**
- * Send a buffer of audio data over the established L2CAP channel,
- * fragmenting it into MTU-sized chunks.
- */
+bool l2cap_stream_is_connected(void)
+{
+    return audio_chan != NULL;
+}
+
 esp_err_t l2cap_stream_send(const uint8_t *data, size_t len)
 {
     if (!audio_chan) {
-        ESP_LOGW(TAG, "No active L2CAP channel");
+        ESP_LOGW(TAG, "No L2CAP channel");
         return ESP_FAIL;
     }
 
@@ -86,32 +72,25 @@ esp_err_t l2cap_stream_send(const uint8_t *data, size_t len)
         size_t chunk = MIN(AUDIO_L2CAP_MTU, len - offset);
         struct os_mbuf *om = os_mbuf_get_pkthdr(NULL, 0);
         if (!om) {
-            ESP_LOGE(TAG, "Failed to allocate mbuf");
+            ESP_LOGE(TAG, "os_mbuf_get_pkthdr failed");
             return ESP_FAIL;
         }
-
-        if (os_mbuf_append(om, data + offset, chunk) != 0) {
-            ESP_LOGE(TAG, "Failed to append %u bytes to mbuf", (unsigned)chunk);
+        if (os_mbuf_append(om, data + offset, chunk)) {
+            ESP_LOGE(TAG, "os_mbuf_append %u bytes failed", (unsigned)chunk);
             os_mbuf_free_chain(om);
             return ESP_FAIL;
         }
-
         int rc = ble_l2cap_send(audio_chan, om);
-        if (rc != 0) {
-            ESP_LOGE(TAG, "ble_l2cap_send failed; rc=%d", rc);
+        if (rc) {
+            ESP_LOGE(TAG, "ble_l2cap_send rc=%d", rc);
             return ESP_FAIL;
         }
-
-        ESP_LOGI(TAG, "Sent %u bytes via L2CAP", (unsigned)chunk);
         offset += chunk;
+        ESP_LOGI(TAG, "Sent %u bytes", (unsigned)chunk);
     }
-
     return ESP_OK;
 }
 
-/**
- * Close the L2CAP channel (if open).
- */
 void l2cap_stream_close(void)
 {
     if (audio_chan) {

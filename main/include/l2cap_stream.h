@@ -1,15 +1,30 @@
-#ifndef L2CAP_STREAM_H
-#define L2CAP_STREAM_H
+#pragma once
 
-//#pragma once
-#include <stdint.h>
+#include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include "esp_err.h"
 
-// Initialize L2CAP CoC server
-esp_err_t l2cap_stream_init(void);
+// Defined in common.h
+// AUDIO_L2CAP_PSM
+// AUDIO_L2CAP_MTU
 
-// Send data over the CoC connection
-esp_err_t l2cap_stream_send(const uint8_t *data, size_t len);
+/**
+ * @brief   Register as an L2CAP CoC server on AUDIO_L2CAP_PSM.
+ */
+esp_err_t    l2cap_stream_init(void);
 
-#endif // L2CAP_STREAM_H
+/**
+ * @brief   Returns true if a peer has opened the CoC channel.
+ */
+bool         l2cap_stream_is_connected(void);
+
+/**
+ * @brief   Send a blob of data, fragmented to AUDIO_L2CAP_MTU bytes.
+ */
+esp_err_t    l2cap_stream_send(const uint8_t *data, size_t len);
+
+/**
+ * @brief   Disconnect and clear the channel.
+ */
+void         l2cap_stream_close(void);

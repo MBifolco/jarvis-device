@@ -1,38 +1,58 @@
 #include "audio_tone.h"
-#include <math.h>
-#include <stdlib.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/i2s_std.h"
+#include "esp_log.h"
 
-static i2s_port_t s_tone_i2s_port = -1;
-static const int SAMPLE_RATE = 16000;
+static const char *TAG = "tone";
+static i2s_port_t tone_i2s_port;
 
-void tone_set_i2s_port(i2s_port_t port) {
-    s_tone_i2s_port = port;
+/**
+ * Store the I2S port to use for tone playback.
+ */
+esp_err_t tone_init(i2s_port_t port) {
+    tone_i2s_port = port;
+    return ESP_OK;
 }
 
-esp_err_t tone_play(uint32_t freq_hz, uint32_t ms, uint8_t vol) {
-    if (s_tone_i2s_port < 0) {
-        return ESP_ERR_INVALID_STATE;  // you forgot to call tone_set_i2s_port()
+/**
+ * Play a simple square wave tone.
+ * (This example assumes a pre-filled buffer; you can replace
+ *  with your own waveform generation as needed.)
+ */
+esp_err_t tone_play(uint32_t freq_hz, uint32_t duration_ms, uint8_t volume) {
+    // Number of samples for 1 period at 16 kHz
+    uint32_t samples_per_period = 16000 / freq_hz;
+    uint32_t total_samples = (16000 * duration_ms) / 1000;
+    // Allocate a small square wave buffer
+    uint16_t *buf = malloc(samples_per_period * sizeof(uint16_t));
+    if (!buf) {
+        ESP_LOGE(TAG, "OOM allocating tone buffer");
+        return ESP_ERR_NO_MEM;
+    }
+    // Fill half the period high, half low
+    for (uint32_t i = 0; i < samples_per_period; i++) {
+        buf[i] = (i < (samples_per_period/2)) ? (volume << 8) : 0;
     }
 
-    int total_samples = (SAMPLE_RATE * ms) / 1000;
-    int16_t *buf = malloc(sizeof(int16_t) * total_samples);
-    if (!buf) return ESP_ERR_NO_MEM;
-
-    const double phase_inc = 2.0 * M_PI * freq_hz / SAMPLE_RATE;
-    for (int i = 0; i < total_samples; i++) {
-        double sample = sin(i * phase_inc);
-        buf[i] = (int16_t)(sample * 32767 * (vol / 100.0));
+    uint32_t sent = 0;
+    while (sent < total_samples) {
+        size_t to_send = MIN(samples_per_period, total_samples - sent);
+        size_t written;
+        esp_err_t err = i2s_write(
+            tone_i2s_port,
+            buf,
+            to_send * sizeof(uint16_t),
+            &written,
+            portMAX_DELAY
+        );
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "i2s_write failed: %d", err);
+            free(buf);
+            return err;
+        }
+        sent += to_send;
     }
-
-    size_t bytes_written = 0;
-    esp_err_t err = i2s_write(
-      s_tone_i2s_port,
-      buf,
-      total_samples * sizeof(int16_t),
-      &bytes_written,
-      portMAX_DELAY
-    );
-
     free(buf);
-    return err;
+    return ESP_OK;
 }
