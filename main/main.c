@@ -176,13 +176,13 @@ static void fetch_task(void *arg)
                 ESP_LOGI(TAG, "Sent %u bytes to phone", captured * sizeof(int16_t));
                 
                 // playback mono buffer
-                size_t written;
-                esp_err_t err = i2s_write(I2S_SPK_PORT, mono,
-                                          captured * sizeof(int16_t),
-                                          &written, portMAX_DELAY);
-                ESP_LOGI(TAG,
-                         "Playback done (frames=%u, bytes=%u, err=%d)",
-                         (unsigned)captured, (unsigned)written, err);
+                //size_t written;
+                //esp_err_t err = i2s_write(I2S_SPK_PORT, mono,
+                //                          captured * sizeof(int16_t),
+                //                          &written, portMAX_DELAY);
+                //ESP_LOGI(TAG,
+                //         "Playback done (frames=%u, bytes=%u, err=%d)",
+                //         (unsigned)captured, (unsigned)written, err);
 
                 free(mono);
 
