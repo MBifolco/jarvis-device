@@ -39,7 +39,7 @@ typedef struct {
 #define I2S_MIC_PORT      I2S_NUM_0
 #define I2S_SPK_PORT      I2S_NUM_1
 
-#define POST_WAKE_SECONDS 5   // seconds to record & then play back
+#define POST_WAKE_SECONDS 2   // seconds to record & then play back
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void i2s_mic_init(void)
