@@ -1,5 +1,6 @@
 dependencies:
   espressif/esp-sr:
-    version: "*"
+    version: '*'
   idf:
-    version: ">=5.0.0"
+    version: '>=5.0.0'
+  espressif/esp_audio_codec: ^2.2.0

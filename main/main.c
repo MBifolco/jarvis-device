@@ -1,4 +1,4 @@
-// wake_word_engine.c — stereo capture for AFE + mono post-wake playback
+// main.c — stereo capture for AFE + mono post-wake playback
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,7 +39,7 @@ typedef struct {
 #define I2S_MIC_PORT      I2S_NUM_0
 #define I2S_SPK_PORT      I2S_NUM_1
 
-#define POST_WAKE_SECONDS 2   // seconds to record & then play back
+#define POST_WAKE_SECONDS 5   // seconds to record & then play back
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void i2s_mic_init(void)
@@ -173,7 +173,6 @@ static void fetch_task(void *arg)
                 // send to phone
                 ESP_LOGI(TAG, "Sending %u bytes to phone…", captured * sizeof(int16_t));
                 audio_tx_send((const uint8_t *)mono, captured * sizeof(int16_t));
-                ESP_LOGI(TAG, "Sent %u bytes to phone", captured * sizeof(int16_t));
                 
                 // playback mono buffer
                 //size_t written;
@@ -204,6 +203,10 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Init Bluetooth...");
     bluetooth_init();
+
+    ESP_LOGI(TAG, "Init compression...");
+    audio_tx_compression_init();
+    ESP_LOGI(TAG, "Audio TX initialized");
 
     
     ESP_LOGI(TAG, "Init AFE+WakeNet...");

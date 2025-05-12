@@ -1,0 +1,7 @@
+menu "Audio Codec Configuration"
+    config ESP_AUDIO_CODEC_ENABLE_ADPCM
+        bool "Enable ADPCM codec"
+        default y
+        help
+            Enable ADPCM codec support in ESP Audio Codec component.
+endmenu 
