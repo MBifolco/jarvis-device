@@ -1,4 +1,4 @@
-// main.c — stereo capture with post-wake VAD stop
+// main.c — stereo capture with post-wake VAD stop and keep-alive
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,6 +6,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_afe_sr_iface.h"
@@ -26,12 +27,15 @@ static TaskHandle_t  feed_handle = NULL;
 static volatile bool    s_recording     = false;  // armed on wake
 static volatile bool    s_stop_record   = false;  // set by VAD or cap
 static volatile bool    s_seen_speech   = false;  // only stop after some speech
+static volatile bool    s_keep_alive    = false;  // after send, remain ready
 static size_t           s_buf_capacity  = 0;      // in samples
 static size_t           s_buf_filled    = 0;      // in samples
 static int16_t         *s_mono_buf      = NULL;   // PCM buffer
+static TimerHandle_t    keepAliveTimer  = NULL;
 
 // Minimum samples to collect before allowing VAD silence to stop
-#define MIN_RECORD_SAMPLES (SAMPLE_RATE / 1) // 0.2 seconds at 16 kHz citeturn16file0
+#define MIN_RECORD_SAMPLES (SAMPLE_RATE / 5)       // 0.2 seconds at 16 kHz citeturn16file0
+#define KEEP_ALIVE_MS      (5000)                 // 5-second keep-alive window
 
 typedef struct {
     esp_afe_sr_iface_t *iface;
@@ -53,6 +57,11 @@ typedef struct {
 #define SAMPLE_RATE       16000
 #define POST_WAKE_SECONDS 30         // max record length
 // ────────────────────────────────────────────────────────────────────────────────
+
+static void keep_alive_callback(TimerHandle_t xTimer) {
+    ESP_LOGI(TAG, "Keep-alive expired, disarming");
+    s_keep_alive = false;
+}
 
 static void i2s_mic_init(void)
 {
@@ -114,7 +123,6 @@ static void feed_task(void *arg)
     size_t frame_bytes = chunksize * channels * sizeof(int16_t);
     int16_t *i2s_buf = malloc(frame_bytes);
 
-    // Maximum number of samples we will store
     s_buf_capacity = POST_WAKE_SECONDS * SAMPLE_RATE;
 
     ESP_LOGI(TAG, "feed_task started (chunk=%d, channels=%d)", chunksize, channels);
@@ -128,15 +136,15 @@ static void feed_task(void *arg)
         // 1) feed AFE for wake/VAD
         info->iface->feed(info->data, i2s_buf);
 
-        // 2) if recording, capture left channel
-        if (s_recording && !s_stop_record && s_mono_buf) {
+        // 2) capture if armed or in keep-alive
+        if ((s_recording || s_keep_alive) && !s_stop_record && s_mono_buf) {
             size_t frames = read_bytes / (channels * sizeof(int16_t));
             for (size_t i = 0; i < frames && s_buf_filled < s_buf_capacity; i++) {
                 s_mono_buf[s_buf_filled++] = i2s_buf[i * channels];
             }
         }
 
-        // 3) if we should stop (VAD after speech or cap reached)
+        // 3) stop on VAD or cap
         if (s_recording && (s_stop_record || s_buf_filled >= s_buf_capacity)) {
             ESP_LOGI(TAG, "Sending %u samples (%.2f s)…",
                      (unsigned)s_buf_filled,
@@ -146,11 +154,13 @@ static void feed_task(void *arg)
                           s_buf_filled * sizeof(int16_t));
 
             free(s_mono_buf);
-            s_mono_buf     = NULL;
-            s_recording    = false;
-            s_stop_record  = false;
-            s_seen_speech  = false;
-            s_buf_filled   = 0;
+            s_mono_buf    = NULL;
+            s_recording   = false;
+            s_seen_speech = false;
+            s_buf_filled  = 0;
+            // start keep-alive
+            s_keep_alive = true;
+            xTimerReset(keepAliveTimer, 0);
         }
     }
 }
@@ -162,40 +172,47 @@ static void fetch_task(void *arg)
 
     while (1) {
         while ((res = info->iface->fetch(info->data)) != NULL) {
-            // 1) Wake word → arm record
+            // 1) Wake word → arm record immediately
             if (res->wakeup_state == WAKENET_DETECTED) {
                 ESP_LOGI(TAG, "Wake word detected!");
+                xTimerStop(keepAliveTimer, 0);
+                s_keep_alive   = false;
+
                 vTaskSuspend(feed_handle);
                 tone_play(1000, 100, 50);
                 gatt_svc_notify_wake();
                 tone_play(1500, 80, 60);
                 vTaskResume(feed_handle);
 
-                // allocate & arm recording
+                // alloc & arm
                 s_mono_buf    = malloc(s_buf_capacity * sizeof(int16_t));
                 s_buf_filled  = 0;
                 s_stop_record = false;
                 s_recording   = true;
-                s_seen_speech = false;  // reset seen-speech flag
+                s_seen_speech = false;
                 ESP_LOGI(TAG, "Recording up to %d seconds…", POST_WAKE_SECONDS);
             }
 
-            // 2) If recording, check VAD:
-            if (s_recording && res->wakeup_state != WAKENET_DETECTED) {
-                switch (res->vad_state) {
-                case AFE_VAD_SPEECH:
-                    // mark that we've actually heard speech
+            // 2) VAD logic
+            if ((s_recording || s_keep_alive) && res->wakeup_state != WAKENET_DETECTED) {
+                if (res->vad_state) {
                     s_seen_speech = true;
-                    break;
-                case AFE_VAD_SILENCE:
-                    // only stop if we've seen some speech AND captured enough frames
-                    if (s_seen_speech && s_buf_filled > MIN_RECORD_SAMPLES) {
-                        ESP_LOGI(TAG, "VAD silence after speech → stopping (samples=%u)", (unsigned)s_buf_filled);
+                    // on new speech in keep-alive, re-arm full record
+                    if (s_keep_alive && !s_recording) {
+                        xTimerStop(keepAliveTimer, 0);
+                        s_keep_alive  = false;
+                        s_mono_buf    = malloc(s_buf_capacity * sizeof(int16_t));
+                        s_buf_filled  = 0;
+                        s_stop_record = false;
+                        s_recording   = true;
+                        s_seen_speech = true;
+                        ESP_LOGI(TAG, "Re-armed recording during keep-alive");
+                    }
+                } else if (!res->vad_state) {
+                    if (s_recording && s_seen_speech && s_buf_filled > MIN_RECORD_SAMPLES) {
+                        ESP_LOGI(TAG, "VAD silence → stopping (samples=%u)", (unsigned)s_buf_filled);
                         s_stop_record = true;
                     }
-                    break;
-                default:
-                    break;
                 }
             }
         }
@@ -212,6 +229,15 @@ void app_main(void)
 
     bluetooth_init();
     audio_tx_compression_init();
+
+    // create keep-alive timer
+    keepAliveTimer = xTimerCreate(
+        "keepAlive",
+        pdMS_TO_TICKS(KEEP_ALIVE_MS),
+        pdFALSE,
+        NULL,
+        keep_alive_callback
+    );
 
     // AFE + WakeNet + VAD
     srmodel_list_t *models = esp_srmodel_init("model");
