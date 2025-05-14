@@ -23,6 +23,7 @@
 
 static const char *TAG = "wakeword";
 static TaskHandle_t  feed_handle = NULL;
+static QueueHandle_t audio_tx_queue = NULL;
 
 // Shared between tasks
 static volatile bool    s_recording     = false;  // armed on wake
@@ -36,12 +37,17 @@ static TimerHandle_t    keepAliveTimer  = NULL;
 
 // Minimum samples to collect before allowing VAD silence to stop
 #define MIN_RECORD_SAMPLES (SAMPLE_RATE / 1)       // 0.2 seconds at 16 kHz citeturn16file0
-#define KEEP_ALIVE_MS      (30000)                 // 5-second keep-alive window
+#define KEEP_ALIVE_MS      (5000)                 // 5-second keep-alive window
 
 typedef struct {
     esp_afe_sr_iface_t *iface;
     esp_afe_sr_data_t   *data;
 } task_info_t;
+
+typedef struct {
+    int16_t *buf;
+    size_t    samples;
+} audio_msg_t;
 
 // ─── HARDWARE & TIMING ─────────────────────────────────────────────────────────
 #define MIC_BCK_IO        GPIO_NUM_5
@@ -131,7 +137,7 @@ static void feed_task(void *arg)
         if (g_playing_back) {
             continue;
         }
-        
+
         size_t read_bytes;
         if (i2s_read(I2S_MIC_PORT, i2s_buf, frame_bytes, &read_bytes, portMAX_DELAY) != ESP_OK) {
             ESP_LOGW(TAG, "I2S read failed");
@@ -151,22 +157,27 @@ static void feed_task(void *arg)
 
         // 3) stop on VAD or cap
         if (s_recording && (s_stop_record || s_buf_filled >= s_buf_capacity)) {
-            ESP_LOGI(TAG, "Sending %u samples (%.2f s)…",
-                     (unsigned)s_buf_filled,
-                     s_buf_filled / (float)SAMPLE_RATE);
-
-            audio_tx_send((const uint8_t*)s_mono_buf,
-                          s_buf_filled * sizeof(int16_t));
-
-            free(s_mono_buf);
+            ESP_LOGI(TAG, "feed_task: captured %u samples, queueing for TX", (unsigned)s_buf_filled);
+        
+            // hand off to audio_tx task
+            audio_msg_t m = {
+              .buf     = s_mono_buf,
+              .samples = s_buf_filled
+            };
+            xQueueSend(audio_tx_queue, &m, 0);
+        
+            // reset state *before* the next wake-word
             s_mono_buf    = NULL;
             s_recording   = false;
+            s_stop_record = false;          // << reset this so keep-alive can re-arm
             s_seen_speech = false;
             s_buf_filled  = 0;
-            // start keep-alive
-            s_keep_alive = true;
+            s_keep_alive  = true;
             xTimerReset(keepAliveTimer, 0);
         }
+        //UBaseType_t free = uxTaskGetStackHighWaterMark(NULL);
+        //ESP_LOGI(TAG, "feed_task stack high water mark: %u bytes free", free * sizeof(StackType_t));
+
     }
 }
 
@@ -221,12 +232,26 @@ static void fetch_task(void *arg)
                 }
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+}
+
+static void audio_tx_worker(void *arg) {
+    audio_msg_t msg;
+    for (;;) {
+        if (xQueueReceive(audio_tx_queue, &msg, portMAX_DELAY)) {
+            ESP_LOGI(TAG, "tx_worker: sending %u samples", (unsigned)msg.samples);
+            audio_tx_send(msg.buf, msg.samples);
+            free(msg.buf);
+        }
     }
 }
 
 void app_main(void)
 {
+    ESP_LOGI(TAG, "Starting up…");
+    //audio_tx_set_codec(AUDIO_CODEC_OPUS);
+
     ESP_LOGI(TAG, "Init I2S, Bluetooth, AFE & compression");
     i2s_mic_init();
     i2s_play_init();
@@ -254,9 +279,21 @@ void app_main(void)
     esp_afe_sr_iface_t *iface = esp_afe_handle_from_config(cfg);
     esp_afe_sr_data_t   *data  = iface->create_from_config(cfg);
 
+    ESP_LOGI(TAG, "Creating audio tx queue");
+    audio_tx_queue = xQueueCreate(4, sizeof(audio_msg_t));
+    xTaskCreate(
+        /*fn=*/ audio_tx_worker,
+        /*name=*/ "audio_tx",
+        /*stack=*/ 24576 ,             // 12 KB stack for BLE + Opus
+        /*arg=*/ NULL,
+        /*prio=*/ 5,
+        /*handle=*/ NULL
+    );
+    
     task_info_t info = { .iface = iface, .data = data };
-    xTaskCreate(feed_task,  "feed",  4096, &info, 5, &feed_handle);
+    xTaskCreate(feed_task,  "feed",  12288, &info, 5, &feed_handle);
     xTaskCreate(fetch_task, "fetch", 4096, &info, 5, NULL);
+    
 
     ESP_LOGI(TAG, "Ready—say the wake word!");
     while (1) {

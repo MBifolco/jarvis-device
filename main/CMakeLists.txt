@@ -12,3 +12,8 @@ idf_component_register(
         bt 
         nvs_flash
 )
+
+
+#set_source_files_properties(
+#  src/audio_tx.c PROPERTIES COMPILE_FLAGS "-fstack-usage"
+#)

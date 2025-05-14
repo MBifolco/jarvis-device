@@ -1,191 +1,214 @@
+// audio_tx.c
+
 #include "audio_tx.h"
 #include "esp_log.h"
 #include "host/ble_hs.h"
 #include "os/os_mbuf.h"
 #include "gatt_svc.h"
-#include "esp_audio_enc_default.h"
 #include "esp_audio_enc_reg.h"
 #include "esp_audio_enc.h"
+#include "freertos/task.h"
+// For ADPCM
 #include "esp_adpcm_enc.h"
+// For Opus
+#include "esp_opus_enc.h"
 
 #include <string.h>
 #include <stdlib.h>
 
-#define TAG "audio_tx"
-#define BLE_CHUNK_SIZE 497
-#define WAV_HEADER_SIZE 46
+#ifndef MIN
+#define MIN(a,b) (((a) < (b)) ? (a) : (b))
+#endif
 
+#define TAG              "audio_tx"
+#define BLE_CHUNK_SIZE   497
+#define WAV_HEADER_SIZE  46
 
+static audio_codec_t   s_codec        = AUDIO_CODEC_ADPCM;
 static esp_audio_enc_handle_t enc_handle = NULL;
-static int in_frame_size = 0;
+static int in_frame_size  = 0;
 static int out_frame_size = 0;
 
-// Build a WAV header for ADPCM format
-static void build_adpcm_wav_header(uint8_t *header, size_t adpcm_len_bytes)
-{
-    uint32_t sample_rate = 16000;
-    uint16_t channels = 1;
-    uint16_t audio_format = 0x11;  // IMA ADPCM
-    uint16_t block_align = 256;
-    uint16_t bits_per_sample = 4;
-    uint16_t extra_size = 2;
-    uint32_t byte_rate = (sample_rate * block_align) / 505;
-    uint32_t fmt_chunk_size = 20;
-    uint32_t wav_size = 36 + adpcm_len_bytes;
-
-    ESP_LOGI(TAG, "ADPCM header: len=%u → bytes @42 = %02x %02x %02x %02x",
-        (unsigned)adpcm_len_bytes,
-        (unsigned)((adpcm_len_bytes >> 0) & 0xff),
-        (unsigned)((adpcm_len_bytes >> 8) & 0xff),
-        (unsigned)((adpcm_len_bytes >> 16) & 0xff),
-        (unsigned)((adpcm_len_bytes >> 24) & 0xff));
-
-    memcpy(header, "RIFF", 4);
-    memcpy(header + 4, &wav_size, 4);
-    memcpy(header + 8, "WAVE", 4);
-    memcpy(header + 12, "fmt ", 4);
-    memcpy(header + 16, &fmt_chunk_size, 4);
-    memcpy(header + 20, &audio_format, 2);
-    memcpy(header + 22, &channels, 2);
-    memcpy(header + 24, &sample_rate, 4);
-    memcpy(header + 28, &byte_rate, 4);
-    memcpy(header + 32, &block_align, 2);
-    memcpy(header + 34, &bits_per_sample, 2);
-    memcpy(header + 36, &extra_size, 2);
-    memcpy(header + 38, "data", 4);
-    memcpy(header + 42, &adpcm_len_bytes, 4);
+// Internal: pick fourcc based on codec
+static uint16_t get_wav_audio_format(void) {
+    return (s_codec == AUDIO_CODEC_ADPCM) ? 0x11 /*IMA ADPCM*/ : 0xFF /*custom*/;
 }
 
+/** Public: switch codec */
+void audio_tx_set_codec(audio_codec_t codec) {
+    s_codec = codec;
+}
+
+/** Initialize the selected encoder */
 esp_err_t audio_tx_compression_init(void)
 {
-    esp_err_t err = esp_adpcm_enc_register();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to register ADPCM encoder: %s", esp_err_to_name(err));
-        return err;
+    esp_err_t err;
+    esp_audio_enc_config_t cfg = {0};
+
+    if (s_codec == AUDIO_CODEC_ADPCM) {
+        err = esp_adpcm_enc_register();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "ADPCM register failed: %s", esp_err_to_name(err));
+            return err;
+        }
+        esp_adpcm_enc_config_t adpcm_cfg = ESP_ADPCM_ENC_CONFIG_DEFAULT();
+        adpcm_cfg.sample_rate = 16000;
+        adpcm_cfg.channel     = 1;
+        adpcm_cfg.bits_per_sample = 16;
+        cfg.type   = ESP_AUDIO_TYPE_ADPCM;
+        cfg.cfg    = &adpcm_cfg;
+        cfg.cfg_sz = sizeof(adpcm_cfg);
+
+    } else { // AUDIO_CODEC_OPUS
+        err = esp_opus_enc_register();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Opus register failed: %s", esp_err_to_name(err));
+            return err;
+        }
+        esp_opus_enc_config_t opus_cfg = ESP_OPUS_ENC_CONFIG_DEFAULT();
+        opus_cfg.sample_rate = 16000;
+        opus_cfg.channel     = 1;
+        opus_cfg.bitrate     = 16000; // tune as you like
+        cfg.type   = ESP_AUDIO_TYPE_OPUS;
+        cfg.cfg    = &opus_cfg;
+        cfg.cfg_sz = sizeof(opus_cfg);
     }
 
-    esp_adpcm_enc_config_t adpcm_cfg = ESP_ADPCM_ENC_CONFIG_DEFAULT();
-    adpcm_cfg.sample_rate = 16000;
-    adpcm_cfg.channel = 1;
-    adpcm_cfg.bits_per_sample = 16;
-
-    esp_audio_enc_config_t enc_cfg = {
-        .type = ESP_AUDIO_TYPE_ADPCM,
-        .cfg = &adpcm_cfg,
-        .cfg_sz = sizeof(adpcm_cfg),
-    };
-
-    err = esp_audio_enc_open(&enc_cfg, &enc_handle);
+    err = esp_audio_enc_open(&cfg, &enc_handle);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open ADPCM encoder: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Open encoder failed: %s", esp_err_to_name(err));
         return err;
     }
-
     err = esp_audio_enc_get_frame_size(enc_handle, &in_frame_size, &out_frame_size);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to get frame size: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Get frame size failed: %s", esp_err_to_name(err));
         return err;
     }
 
-    ESP_LOGI(TAG, "ADPCM encoder initialized (in=%d, out=%d)", in_frame_size, out_frame_size);
+    ESP_LOGI(TAG, "%s encoder in=%d out=%d",
+             s_codec==AUDIO_CODEC_ADPCM?"ADPCM":"Opus",
+             in_frame_size, out_frame_size);
     return ESP_OK;
 }
 
-esp_err_t audio_tx_send(const uint8_t *pcm, size_t len)
+// Build a tiny WAV header only for ADPCM
+static void build_adpcm_wav_header(uint8_t *h, size_t payload_bytes)
+{
+    uint32_t sample_rate = 16000;
+    uint16_t channels    = 1;
+    uint16_t bits_per_sample = 4;   // ADPCM nibble size
+    uint16_t block_align     = 256; // ADPCM block align
+    uint16_t extra_size      = 2;
+    uint32_t byte_rate       = (sample_rate * block_align) / 505;
+    uint32_t fmt_chunk_size  = 20;
+    uint32_t wav_size        = 36 + payload_bytes;
+
+    memcpy(h, "RIFF", 4);
+    memcpy(h+4, &wav_size, 4);
+    memcpy(h+8, "WAVEfmt ", 8);
+    memcpy(h+16, &fmt_chunk_size, 4);
+    uint16_t fmt = get_wav_audio_format();
+    memcpy(h+20, &fmt, 2);
+    memcpy(h+22, &channels, 2);
+    memcpy(h+24, &sample_rate, 4);
+    memcpy(h+28, &byte_rate, 4);
+    memcpy(h+32, &block_align, 2);
+    memcpy(h+34, &bits_per_sample, 2);
+    memcpy(h+36, &extra_size, 2);
+    memcpy(h+38, "data", 4);
+    memcpy(h+42, &payload_bytes, 4);
+}
+
+// based on your current audio_tx.c :contentReference[oaicite:2]{index=2}
+// lib/src/audio_tx.c
+// audio_tx.c
+
+esp_err_t audio_tx_send(const int16_t *pcm_samples, size_t sample_count)
 {
     if (!chr_conn_handle || !audio_notify_handle) {
-        ESP_LOGW(TAG, "No active BLE connection or audio handle");
+        ESP_LOGW(TAG, "No BLE conn or char");
         return ESP_FAIL;
     }
 
-    const uint8_t *input_ptr = pcm;
-    size_t input_remaining = len;
+    ESP_LOGI(TAG, "audio_tx_send: %u samples", (unsigned)sample_count);
+    // Compute sizes
+    size_t pcm_bytes   = sample_count * sizeof(int16_t);
+    size_t frame_bytes = (size_t)in_frame_size;  // in bytes
+    size_t out_cap     = (s_codec==AUDIO_CODEC_OPUS)
+                        ? (size_t)out_frame_size * 2
+                        : (size_t)out_frame_size;
 
-    uint8_t *inbuf = malloc(in_frame_size);
-    uint8_t *outbuf = malloc(out_frame_size);
+    // Allocate temp buffers
+    uint8_t *inbuf  = malloc(frame_bytes);
+    uint8_t *outbuf = malloc(out_cap);
     if (!inbuf || !outbuf) {
-        ESP_LOGE(TAG, "Failed to allocate compression buffers");
-        free(inbuf); free(outbuf);
-        return ESP_ERR_NO_MEM;
-    }
-
-    uint8_t *adpcm_buf = malloc(len);
-    if (!adpcm_buf) {
-        ESP_LOGE(TAG, "Failed to allocate ADPCM buffer");
-        free(inbuf); free(outbuf);
-        return ESP_ERR_NO_MEM;
-    }
-
-    size_t adpcm_offset = 0;
-    while (input_remaining >= in_frame_size) {
-        memcpy(inbuf, input_ptr, in_frame_size);
-        input_ptr += in_frame_size;
-        input_remaining -= in_frame_size;
-
-        esp_audio_enc_in_frame_t in_frame = {
-            .buffer = inbuf,
-            .len = in_frame_size,
-        };
-
-        esp_audio_enc_out_frame_t out_frame = {
-            .buffer = outbuf,
-            .len = out_frame_size,
-        };
-
-        esp_err_t err = esp_audio_enc_process(enc_handle, &in_frame, &out_frame);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "ADPCM encoding failed: %s", esp_err_to_name(err));
-            break;
-        }
-
-        memcpy(adpcm_buf + adpcm_offset, outbuf, out_frame.len);
-        adpcm_offset += out_frame.len;
-    }
-
-    uint8_t header[WAV_HEADER_SIZE] = {0};
-    build_adpcm_wav_header(header, adpcm_offset);
-
-    ESP_LOGI(TAG, "Sending ADPCM WAV header");
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(header, WAV_HEADER_SIZE);
-    if (!om) {
-        ESP_LOGE(TAG, "Failed to allocate BLE buffer for header");
-        goto cleanup;
-    }
-    int rc = ble_gatts_notify_custom(chr_conn_handle, audio_notify_handle, om);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "Failed to notify WAV header; rc=%d", rc);
+        ESP_LOGE(TAG, "OOM encoding buffers");
         goto cleanup;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    ESP_LOGI(TAG, "Sending %d bytes of compressed ADPCM", (int)adpcm_offset);
-    size_t offset = 0;
-    while (offset < adpcm_offset) {
-        size_t chunk_len = (adpcm_offset - offset > BLE_CHUNK_SIZE)
-                               ? BLE_CHUNK_SIZE
-                               : (adpcm_offset - offset);
-        om = ble_hs_mbuf_from_flat(adpcm_buf + offset, chunk_len);
-        if (!om) {
-            ESP_LOGE(TAG, "Failed to allocate BLE buffer at offset %d", (int)offset);
-            break;
-        }
-
-        rc = ble_gatts_notify_custom(chr_conn_handle, audio_notify_handle, om);
-        if (rc != 0) {
-            ESP_LOGE(TAG, "Failed to notify chunk at offset %d; rc=%d", (int)offset, rc);
-            break;
-        }
-        ESP_LOGI(TAG, "Notifying chunk: offset=%d len=%d adpcm_offset=%d BLE_CHUNK_SIZE=%d ", (int)offset, (int)chunk_len, (int)adpcm_offset, (int)BLE_CHUNK_SIZE);
-        offset += chunk_len;
-        vTaskDelay(pdMS_TO_TICKS(60));
+    // PASS #1: measure total size (including 2-byte prefixes)
+    size_t total_payload = 0;
+    const uint8_t *p = (const uint8_t*)pcm_samples;
+    size_t rem = pcm_bytes;
+    while (rem >= frame_bytes) {
+        memcpy(inbuf, p, frame_bytes);
+        p   += frame_bytes;
+        rem -= frame_bytes;
+        esp_audio_enc_in_frame_t  inf  = { .buffer=inbuf,  .len=frame_bytes };
+        esp_audio_enc_out_frame_t outf = { .buffer=outbuf, .len=out_cap     };
+        if (esp_audio_enc_process(enc_handle, &inf, &outf) != ESP_OK) break;
+        total_payload += outf.len + 2;  // +2 for our length prefix
     }
 
-    ESP_LOGI(TAG, "Audio transmission complete (ADPCM, %d bytes total)", (int)(adpcm_offset + WAV_HEADER_SIZE));
+    ESP_LOGI(TAG, "Measured total_payload = %u bytes", total_payload);
+
+    // Send WAV header with total_payload
+    {
+        uint8_t hdr[WAV_HEADER_SIZE] = {0};
+        // Reuse your existing builder; get_wav_audio_format() yields 0x11 or 0xFF
+        build_adpcm_wav_header(hdr, total_payload);
+        struct os_mbuf *omh = ble_hs_mbuf_from_flat(hdr, WAV_HEADER_SIZE);
+        ble_gatts_notify_custom(chr_conn_handle, audio_notify_handle, omh);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    // PASS #2: actually encode + stream each frame with 2-byte length
+    p   = (const uint8_t*)pcm_samples;
+    rem = pcm_bytes;
+    while (rem >= frame_bytes) {
+        memcpy(inbuf, p, frame_bytes);
+        p   += frame_bytes;
+        rem -= frame_bytes;
+
+        esp_audio_enc_in_frame_t  inf  = { .buffer=inbuf,  .len=frame_bytes };
+        esp_audio_enc_out_frame_t outf = { .buffer=outbuf, .len=out_cap     };
+        if (esp_audio_enc_process(enc_handle, &inf, &outf) != ESP_OK) {
+            ESP_LOGE(TAG, "encode error");
+            break;
+        }
+
+        // Build a 2-byte little-endian length prefix + payload
+        uint16_t len16 = outf.len;
+        uint8_t tmp[2];
+        tmp[0] = len16 & 0xFF;
+        tmp[1] = (len16 >> 8) & 0xFF;
+
+        // Send prefix
+        {
+          struct os_mbuf *om = ble_hs_mbuf_from_flat(tmp, 2);
+          ble_gatts_notify_custom(chr_conn_handle, audio_notify_handle, om);
+          vTaskDelay(pdMS_TO_TICKS(5));
+        }
+        // Send frame data (in one go, since outf.len < BLE_CHUNK_SIZE)
+        {
+          struct os_mbuf *om = ble_hs_mbuf_from_flat(outbuf, outf.len);
+          ble_gatts_notify_custom(chr_conn_handle, audio_notify_handle, om);
+          vTaskDelay(pdMS_TO_TICKS( (s_codec==AUDIO_CODEC_ADPCM)?60:20 ));
+        }
+    }
 
 cleanup:
     free(inbuf);
     free(outbuf);
-    free(adpcm_buf);
     return ESP_OK;
 }
