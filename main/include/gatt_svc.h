@@ -14,6 +14,15 @@
 /* NimBLE GAP APIs */
 #include "host/ble_gap.h"
 
+/** Currently connected peer (0 when none) */
+extern uint16_t chr_conn_handle;
+
+/** Handle of our notify characteristic (audio → phone) */
+extern uint16_t audio_notify_handle;
+
+/** Handle of our write characteristic (phone → device) */
+extern uint16_t audio_write_handle;
+
 /* Public function declarations */
 void gatt_svr_register_cb(struct ble_gatt_register_ctxt *ctxt, void *arg);
 void gatt_svr_subscribe_cb(struct ble_gap_event *event);

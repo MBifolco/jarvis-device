@@ -15,8 +15,6 @@
 #define BLE_CHUNK_SIZE 497
 #define WAV_HEADER_SIZE 46
 
-extern uint16_t audio_chr_handle;  // declared in gatt_svc.c
-extern int chr_conn_handle;
 
 static esp_audio_enc_handle_t enc_handle = NULL;
 static int in_frame_size = 0;
@@ -95,7 +93,7 @@ esp_err_t audio_tx_compression_init(void)
 
 esp_err_t audio_tx_send(const uint8_t *pcm, size_t len)
 {
-    if (!chr_conn_handle || !audio_chr_handle) {
+    if (!chr_conn_handle || !audio_notify_handle) {
         ESP_LOGW(TAG, "No active BLE connection or audio handle");
         return ESP_FAIL;
     }
@@ -153,7 +151,7 @@ esp_err_t audio_tx_send(const uint8_t *pcm, size_t len)
         ESP_LOGE(TAG, "Failed to allocate BLE buffer for header");
         goto cleanup;
     }
-    int rc = ble_gatts_notify_custom(chr_conn_handle, audio_chr_handle, om);
+    int rc = ble_gatts_notify_custom(chr_conn_handle, audio_notify_handle, om);
     if (rc != 0) {
         ESP_LOGE(TAG, "Failed to notify WAV header; rc=%d", rc);
         goto cleanup;
@@ -173,7 +171,7 @@ esp_err_t audio_tx_send(const uint8_t *pcm, size_t len)
             break;
         }
 
-        rc = ble_gatts_notify_custom(chr_conn_handle, audio_chr_handle, om);
+        rc = ble_gatts_notify_custom(chr_conn_handle, audio_notify_handle, om);
         if (rc != 0) {
             ESP_LOGE(TAG, "Failed to notify chunk at offset %d; rc=%d", (int)offset, rc);
             break;

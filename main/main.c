@@ -19,6 +19,7 @@
 #include "gatt_svc.h"
 #include "audio_tone.h"
 #include "audio_tx.h"
+#include "audio_rx.h"
 
 static const char *TAG = "wakeword";
 static TaskHandle_t  feed_handle = NULL;
@@ -34,8 +35,8 @@ static int16_t         *s_mono_buf      = NULL;   // PCM buffer
 static TimerHandle_t    keepAliveTimer  = NULL;
 
 // Minimum samples to collect before allowing VAD silence to stop
-#define MIN_RECORD_SAMPLES (SAMPLE_RATE / 5)       // 0.2 seconds at 16 kHz citeturn16file0
-#define KEEP_ALIVE_MS      (5000)                 // 5-second keep-alive window
+#define MIN_RECORD_SAMPLES (SAMPLE_RATE / 1)       // 0.2 seconds at 16 kHz citeturn16file0
+#define KEEP_ALIVE_MS      (30000)                 // 5-second keep-alive window
 
 typedef struct {
     esp_afe_sr_iface_t *iface;
@@ -228,6 +229,7 @@ void app_main(void)
     tone_set_i2s_port(I2S_SPK_PORT);
 
     bluetooth_init();
+    audio_rx_init();
     audio_tx_compression_init();
 
     // create keep-alive timer
