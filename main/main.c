@@ -128,6 +128,10 @@ static void feed_task(void *arg)
 
     ESP_LOGI(TAG, "feed_task started (chunk=%d, channels=%d)", chunksize, channels);
     while (1) {
+        if (g_playing_back) {
+            continue;
+        }
+        
         size_t read_bytes;
         if (i2s_read(I2S_MIC_PORT, i2s_buf, frame_bytes, &read_bytes, portMAX_DELAY) != ESP_OK) {
             ESP_LOGW(TAG, "I2S read failed");

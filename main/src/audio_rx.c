@@ -69,11 +69,16 @@ void audio_rx_on_write(const uint8_t *data, size_t len)
         const uint8_t *pcm    = s_buf + 44;
         size_t        pcm_bytes = s_expected - 44;
 
+        g_playing_back = true;
+        ESP_LOGI(TAG, "→ SPEAKER ON");
+
         size_t written = 0;
         // blocking write to I2S
         ESP_ERROR_CHECK(i2s_write(I2S_SPK_PORT, pcm, pcm_bytes, &written, portMAX_DELAY));
         ESP_LOGI(TAG, "i2s wrote %u PCM bytes", (unsigned)written);
 
+        g_playing_back = false;
+        ESP_LOGI(TAG, "← SPEAKER OFF"); 
         // reset for next transmission
         s_filled   = 0;
         s_expected = 0;
