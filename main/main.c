@@ -36,7 +36,7 @@ static TimerHandle_t    keepAliveTimer  = NULL;
 
 // Minimum samples to collect before allowing VAD silence to stop
 #define MIN_RECORD_SAMPLES (SAMPLE_RATE / 1)       // 0.2 seconds at 16 kHz citeturn16file0
-#define KEEP_ALIVE_MS      (30000)                 // 5-second keep-alive window
+#define KEEP_ALIVE_MS      (20000)                 // 5-second keep-alive window
 
 typedef struct {
     esp_afe_sr_iface_t *iface;
@@ -44,13 +44,13 @@ typedef struct {
 } task_info_t;
 
 // ─── HARDWARE & TIMING ─────────────────────────────────────────────────────────
-#define MIC_BCK_IO        GPIO_NUM_5
-#define MIC_WS_IO         GPIO_NUM_6
-#define MIC_DATA_IO       GPIO_NUM_4
+#define MIC_BCK_IO        GPIO_NUM_5 // SCK purple
+#define MIC_WS_IO         GPIO_NUM_6 // WS green
+#define MIC_DATA_IO       GPIO_NUM_4 // SD orange
 
-#define SPK_BCK_IO        GPIO_NUM_7
-#define SPK_WS_IO         GPIO_NUM_8
-#define SPK_DATA_IO       GPIO_NUM_9
+#define SPK_BCK_IO        GPIO_NUM_10 // BCK purple
+#define SPK_WS_IO         GPIO_NUM_11 // LRC green
+#define SPK_DATA_IO       GPIO_NUM_9 // DIN orange
 
 #define I2S_MIC_PORT      I2S_NUM_0
 #define I2S_SPK_PORT      I2S_NUM_1

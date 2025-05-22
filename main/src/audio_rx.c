@@ -1,86 +1,141 @@
 /* audio_rx.c */
 #include "audio_rx.h"
 #include <string.h>
+#include <stdlib.h>
 #include "esp_log.h"
 #include "driver/i2s.h"
 
 static const char *TAG = "audio_rx";
 
-// --- adjust these to match your board wiring ---
+// I2S configuration
 #define I2S_SPK_PORT      I2S_NUM_1
+#define SAMPLE_RATE       24000
 #define BITS_PER_SAMPLE   16
 #define CHANNELS          1
 
-// --- internal buffer to accumulate one WAV file ---
-static uint8_t *s_buf = NULL;
-static size_t   s_capacity = 0;
-static size_t   s_filled   = 0;
-static size_t   s_expected = 0;
+// ADPCM decoder state
+static int16_t  adpcm_pred;    // predictor (previous PCM sample)
+static int      adpcm_index;   // step index
+
+// IMA ADPCM tables
+static const int step_table[89] = {
+     7, 8, 9, 10, 11, 12, 13, 14, 16, 17,
+    19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
+    50, 55, 60, 66, 73, 80, 88, 97, 107,118,
+   130,143,157,173,190,209,230,253,279,307,
+   337,371,408,449,494,544,598,658,724,796,
+   876,963,1060,1166,1282,1411,1552,1707,1878,2066,
+   2272,2499,2749,3024,3327,3660,4026,4428,4871,5358,
+   5894,6484,7132,7845,8630,9493,10442,11487,12635,13899,
+   15289,16818,18500,20350,22385,24623,27086,29794,32767
+};
+static const int index_table[16] = {
+   -1, -1, -1, -1, 2, 4, 6, 8,
+   -1, -1, -1, -1, 2, 4, 6, 8
+};
 
 void audio_rx_init(void)
 {
-    // allocate a reasonable max size: 5s @ max expected sample rate (e.g. 48kHz * 2B * 5s)
-    s_capacity = 48000 * (BITS_PER_SAMPLE/8) * 5;
-    s_buf      = malloc(s_capacity);
-    s_filled   = 0;
-    s_expected = 0;
+    // initialize ADPCM state
+    adpcm_pred  = 0;
+    adpcm_index = 0;
+
+    // configure I2S at a default rate (will be updated if needed)
+    i2s_zero_dma_buffer(I2S_SPK_PORT);
+    i2s_set_clk(I2S_SPK_PORT, SAMPLE_RATE, BITS_PER_SAMPLE, CHANNELS);
 }
 
-static uint32_t read_le32(const uint8_t *p) {
-    return (uint32_t)p[0]
-         | ((uint32_t)p[1] << 8)
-         | ((uint32_t)p[2] << 16)
-         | ((uint32_t)p[3] << 24);
+// simple integer clamp
+static inline int clamp_int(int v, int lo, int hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+// Decode a single ADPCM block into PCM samples.
+// 'in' is adpcm_data of length 'in_bytes'; 'out' must be large enough.
+// Returns number of int16_t samples written.
+static size_t decode_adpcm_block(const uint8_t *in, size_t in_bytes,
+                                 int16_t *out)
+{
+    size_t out_count = 0;
+    size_t i = 0;
+
+    if (in_bytes < 4) return 0;
+
+    // read initial predictor + index
+    adpcm_pred  = (int16_t)((in[1] << 8) | in[0]);
+    adpcm_index = in[2] & 0x7F;
+    i = 4;
+
+    // emit predictor as first sample
+    out[out_count++] = adpcm_pred;
+
+    // for each byte, decode two 4-bit samples
+    while (i < in_bytes) {
+        uint8_t byte = in[i++];
+        for (int shift = 0; shift <= 4; shift += 4) {
+            int nibble = (byte >> shift) & 0x0F;
+            int step   = step_table[adpcm_index];
+            int diff   = step >> 3;
+            if (nibble & 1) diff += step >> 2;
+            if (nibble & 2) diff += step >> 1;
+            if (nibble & 4) diff += step;
+            if (nibble & 8) diff = -diff;
+
+            // update predictor and clamp to 16-bit range
+            adpcm_pred = (int16_t)clamp_int(adpcm_pred + diff, -32768, 32767);
+
+            // update index and clamp to valid table range
+            adpcm_index = clamp_int(adpcm_index + index_table[nibble], 0, 88);
+
+            out[out_count++] = adpcm_pred;
+        }
+    }
+    return out_count;
 }
 
 void audio_rx_on_write(const uint8_t *data, size_t len)
 {
-    if (s_filled + len > s_capacity) {
-        ESP_LOGW(TAG, "overflow, resetting buffer");
-        s_filled   = 0;
-        s_expected = 0;
+    ESP_LOGD(TAG, "ADPCM chunk in: %u bytes", (unsigned)len);
+
+    // temp buffer for this chunk's PCM
+    int16_t *temp = malloc(sizeof(int16_t) * len * 2);
+    if (!temp) {
+        ESP_LOGE(TAG, "malloc failed");
+        return;
     }
 
-    // copy chunk into buffer
-    memcpy(s_buf + s_filled, data, len);
-    s_filled += len;
-    ESP_LOGD(TAG, "got chunk %u bytes (filled=%u)", (unsigned)len, (unsigned)s_filled);
-
-    // parse WAV header once we have at least 44 bytes
-    if (s_expected == 0 && s_filled >= 44) {
-        // extract sample rate from header offset 24
-        uint32_t sample_rate = read_le32(s_buf + 24);
-        ESP_LOGI(TAG, "WAV header: sample_rate=%u, channels=%u, bits/sample=%u",
-                 (unsigned)sample_rate, CHANNELS, BITS_PER_SAMPLE);
-        // reconfigure I2S to match incoming stream
-        i2s_set_clk(I2S_SPK_PORT, sample_rate, BITS_PER_SAMPLE, CHANNELS);
-
-        // data chunk length at offset 40
-        uint32_t data_len = read_le32(s_buf + 40);
-        s_expected = 44 + data_len;
-        ESP_LOGI(TAG, "expecting WAV total %u bytes", (unsigned)s_expected);
+    size_t samples = decode_adpcm_block(data, len, temp);
+    if (samples > 0 && (pcm_filled + samples) <= MAX_SAMPLES) {
+        memcpy(pcm_accum + pcm_filled, temp, samples * sizeof(int16_t));
+        pcm_filled += samples;
+    } else if (pcm_filled + samples > MAX_SAMPLES) {
+        ESP_LOGW(TAG, "PCM buffer overflow – resetting");
+        pcm_filled = 0;
     }
+    free(temp);
+}
 
-    // once full WAV received → play
-    if (s_expected > 0 && s_filled >= s_expected) {
-        ESP_LOGI(TAG, "full WAV received (%u bytes), playing…", (unsigned)s_filled);
+/// Call this *once*, after you've sent the last BLE write,
+/// to push the entire accumulated PCM out in one go:
+void audio_rx_playback(void)
+{
+    ESP_LOGI(TAG, "Playing back %u samples in one write", (unsigned)pcm_filled);
+    if (pcm_filled == 0) return;
 
-        // skip 44-byte header
-        const uint8_t *pcm    = s_buf + 44;
-        size_t        pcm_bytes = s_expected - 44;
+    size_t written = 0;
+    ESP_ERROR_CHECK(
+      i2s_write(
+        I2S_SPK_PORT,
+        pcm_accum,
+        pcm_filled * sizeof(int16_t),
+        &written,
+        portMAX_DELAY
+      )
+    );
+    ESP_LOGI(TAG, "I2S wrote %u bytes", (unsigned)written);
 
-        g_playing_back = true;
-        ESP_LOGI(TAG, "→ SPEAKER ON");
-
-        size_t written = 0;
-        // blocking write to I2S
-        ESP_ERROR_CHECK(i2s_write(I2S_SPK_PORT, pcm, pcm_bytes, &written, portMAX_DELAY));
-        ESP_LOGI(TAG, "i2s wrote %u PCM bytes", (unsigned)written);
-
-        g_playing_back = false;
-        ESP_LOGI(TAG, "← SPEAKER OFF"); 
-        // reset for next transmission
-        s_filled   = 0;
-        s_expected = 0;
-    }
+    // reset for next stream
+    pcm_filled = 0;
 }
