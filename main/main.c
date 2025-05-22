@@ -44,13 +44,13 @@ typedef struct {
 } task_info_t;
 
 // ─── HARDWARE & TIMING ─────────────────────────────────────────────────────────
-#define MIC_BCK_IO        GPIO_NUM_5
-#define MIC_WS_IO         GPIO_NUM_6
-#define MIC_DATA_IO       GPIO_NUM_4
+#define MIC_BCK_IO        GPIO_NUM_5 // SCK purple
+#define MIC_WS_IO         GPIO_NUM_6 // WS green
+#define MIC_DATA_IO       GPIO_NUM_4 // SD orange
 
-#define SPK_BCK_IO        GPIO_NUM_7
-#define SPK_WS_IO         GPIO_NUM_8
-#define SPK_DATA_IO       GPIO_NUM_9
+#define SPK_BCK_IO        GPIO_NUM_10 // BCK purple
+#define SPK_WS_IO         GPIO_NUM_11 // LRC green
+#define SPK_DATA_IO       GPIO_NUM_9 // DIN orange
 
 #define I2S_MIC_PORT      I2S_NUM_0
 #define I2S_SPK_PORT      I2S_NUM_1
@@ -184,9 +184,10 @@ static void fetch_task(void *arg)
                 s_keep_alive   = false;
 
                 vTaskSuspend(feed_handle);
+                ESP_LOGI(TAG, "Tone Play");
                 tone_play(1000, 100, 50);
                 gatt_svc_notify_wake();
-                tone_play(1500, 80, 60);
+                //tone_play(1500, 80, 60);
                 vTaskResume(feed_handle);
 
                 // alloc & arm
