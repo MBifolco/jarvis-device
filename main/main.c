@@ -20,6 +20,7 @@
 #include "audio_tone.h"
 #include "audio_tx.h"
 #include "audio_rx.h"
+#include "config.h"
 
 static const char *TAG = "wakeword";
 static TaskHandle_t  feed_handle = NULL;
@@ -231,6 +232,8 @@ void app_main(void)
     i2s_mic_init();
     i2s_play_init();
     tone_set_i2s_port(I2S_SPK_PORT);
+    
+    config_init();
 
     bluetooth_init();
     audio_rx_init();
@@ -258,6 +261,8 @@ void app_main(void)
     xTaskCreate(feed_task,  "feed",  4096, &info, 5, &feed_handle);
     xTaskCreate(fetch_task, "fetch", 4096, &info, 5, NULL);
 
+    tone_play(1000, 100, 50);
+    
     ESP_LOGI(TAG, "Ready—say the wake word!");
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));

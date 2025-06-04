@@ -8,6 +8,7 @@
 #include "common.h"
 #include "os/os_mbuf.h"
 #include "audio_rx.h"
+#include "config.h"
 /* Private function declarations */
 static int chr_access(uint16_t conn_handle, uint16_t attr_handle,
                                  struct ble_gatt_access_ctxt *ctxt, void *arg);
@@ -21,6 +22,7 @@ uint16_t chr_conn_handle = 0;
 uint16_t wake_chr_handle;
 uint16_t audio_notify_handle;
 uint16_t audio_write_handle;
+uint16_t config_ctrl_handle;
 static bool handle_inited = false;
 static bool ind_status = false;
 
@@ -61,7 +63,7 @@ static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
             },
             {
                 /* Phone → device (write only) */
-                .uuid       = BLE_UUID128_DECLARE(
+                .uuid = BLE_UUID128_DECLARE(
                     0x4E, 0x5F, 0x6A, 0x8B,
                     0xCD, 0x12, 0x4F, 0xAB,
                     0x90, 0xDE, 0x12, 0x34,
@@ -70,6 +72,18 @@ static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
                 .access_cb  = chr_access,
                 .flags      = BLE_GATT_CHR_F_WRITE_NO_RSP,
                 .val_handle = &audio_write_handle,
+            },
+            {
+                // configuration characteristic
+                .uuid = BLE_UUID128_DECLARE(
+                    0x79, 0xd4, 0xc3, 0xb2,
+                    0x02, 0x0e, 0x67, 0xa5,
+                    0x72, 0x43, 0xcc, 0x58, 
+                    0x0b, 0xc1, 0x7a, 0xf4
+                ),
+                .access_cb  = chr_access,
+                .flags      = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_NOTIFY,
+                .val_handle = &config_ctrl_handle,
             },
             {
                 0  // End of characteristic list
@@ -102,7 +116,16 @@ static int chr_access(uint16_t conn_handle, uint16_t attr_handle,
             uint8_t buf[len];
             if (os_mbuf_copydata(ctxt->om, 0, len, buf) == 0) {
                 audio_rx_on_write(buf, len);
-                ESP_LOGI(TAG, "Wrote %u bytes from phone", (unsigned)len);
+                ESP_LOGI(TAG, "Audio Characteristic - Wrote %u bytes from phone", (unsigned)len);
+                return 0;
+            }
+            return 0;
+        }else if (attr_handle == config_ctrl_handle) {
+            size_t len = OS_MBUF_PKTLEN(ctxt->om);
+            uint8_t buf[len];
+            if (os_mbuf_copydata(ctxt->om, 0, len, buf) == 0) {
+                config_handle_write(buf, len);
+                ESP_LOGI(TAG, "Config Characteristic - Wrote %u bytes from phone", (unsigned)len);
                 return 0;
             }
             return 0;
@@ -163,6 +186,13 @@ void gatt_svr_register_cb(struct ble_gatt_register_ctxt *ctxt, void *arg) {
             0x56, 0x78, 0x90, 0xAB
         );
 
+        static const ble_uuid128_t config_ctrl_uuid = BLE_UUID128_INIT(
+            0x79, 0xd4, 0xc3, 0xb2,
+            0x02, 0x0e, 0x67, 0xa5,
+            0x72, 0x43, 0xcc, 0x58,
+            0x0b, 0xc1, 0x7a, 0xf4
+        );
+
         if (ble_uuid_cmp(ctxt->chr.chr_def->uuid, &wake_uuid.u) == 0) {
             wake_chr_handle = ctxt->chr.val_handle;
             ESP_LOGI(TAG, "Saved wake_chr_handle = %d", wake_chr_handle);
@@ -174,6 +204,10 @@ void gatt_svr_register_cb(struct ble_gatt_register_ctxt *ctxt, void *arg) {
         if (ble_uuid_cmp(ctxt->chr.chr_def->uuid, &audio_write_uuid.u) == 0) {
             audio_write_handle = ctxt->chr.val_handle;
             ESP_LOGI(TAG, "Saved audio_write_handle = %d", audio_write_handle);
+        }
+        if (ble_uuid_cmp(ctxt->chr.chr_def->uuid, &config_ctrl_uuid.u) == 0) {
+            config_ctrl_handle = ctxt->chr.val_handle;
+            ESP_LOGI(TAG, "Saved config_ctrl_handle = %d", config_ctrl_handle);
         }
         break;
 
@@ -211,6 +245,18 @@ void gatt_svr_subscribe_cb(struct ble_gap_event *event) {
         chr_conn_handle = event->subscribe.conn_handle;
         handle_inited = true;
         ind_status = event->subscribe.cur_indicate;
+    } else if (event->subscribe.attr_handle == config_ctrl_handle) {
+        // do something cause of the event
+        ESP_LOGI(TAG, "Config characteristic subscribed");
+        config_init();
+    } else if (event->subscribe.attr_handle == audio_notify_handle) {
+        // do something cause of the event
+        ESP_LOGI(TAG, "Audio notify characteristic subscribed");
+    } else if (event->subscribe.attr_handle == wake_chr_handle) {
+        // do something cause of the event
+        ESP_LOGI(TAG, "Wake-word notify characteristic subscribed");
+    } else {
+        ESP_LOGW(TAG, "Unknown subscribe attr_handle=%d", event->subscribe.attr_handle);
     }
 }
 
