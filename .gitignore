@@ -52,3 +52,6 @@ Mkfile.old
 dkms.conf
 build/
 managed_components/
+*.old
+*workspace
+*.lock

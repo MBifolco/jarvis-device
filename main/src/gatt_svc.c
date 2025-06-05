@@ -7,7 +7,7 @@
 #include "gatt_svc.h"
 #include "common.h"
 #include "os/os_mbuf.h"
-
+#include "audio_rx.h"
 /* Private function declarations */
 static int chr_access(uint16_t conn_handle, uint16_t attr_handle,
                                  struct ble_gatt_access_ctxt *ctxt, void *arg);
@@ -19,7 +19,8 @@ static uint16_t chr_val_handle;
 
 uint16_t chr_conn_handle = 0;
 uint16_t wake_chr_handle;
-uint16_t audio_chr_handle;
+uint16_t audio_notify_handle;
+uint16_t audio_write_handle;
 static bool handle_inited = false;
 static bool ind_status = false;
 
@@ -56,7 +57,19 @@ static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
                 ),
                 .access_cb  = chr_access,  // Or NULL if unused
                 .flags      = BLE_GATT_CHR_F_NOTIFY,
-                .val_handle = &audio_chr_handle,
+                .val_handle = &audio_notify_handle,
+            },
+            {
+                /* Phone → device (write only) */
+                .uuid       = BLE_UUID128_DECLARE(
+                    0x4E, 0x5F, 0x6A, 0x8B,
+                    0xCD, 0x12, 0x4F, 0xAB,
+                    0x90, 0xDE, 0x12, 0x34,
+                    0x56, 0x78, 0x90, 0xAB
+                ),
+                .access_cb  = chr_access,
+                .flags      = BLE_GATT_CHR_F_WRITE_NO_RSP,
+                .val_handle = &audio_write_handle,
             },
             {
                 0  // End of characteristic list
@@ -81,35 +94,23 @@ static int chr_access(uint16_t conn_handle, uint16_t attr_handle,
 
     /* Read characteristic event */
     case BLE_GATT_ACCESS_OP_READ_CHR:
-        /* Verify connection handle */
-        if (conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-            ESP_LOGI(TAG, "characteristic read; conn_handle=%d attr_handle=%d",
-                     conn_handle, attr_handle);
-        } else {
-            ESP_LOGI(TAG, "characteristic read by nimble stack; attr_handle=%d",
-                     attr_handle);
-        }
-
+        return 0;
+    case BLE_GATT_ACCESS_OP_WRITE_CHR:
         /* Verify attribute handle */
-        if (attr_handle == chr_val_handle) {
-        
-            //do whatever
-            //return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+        if (attr_handle == audio_write_handle) {
+            size_t len = OS_MBUF_PKTLEN(ctxt->om);
+            uint8_t buf[len];
+            if (os_mbuf_copydata(ctxt->om, 0, len, buf) == 0) {
+                audio_rx_on_write(buf, len);
+                ESP_LOGI(TAG, "Wrote %u bytes from phone", (unsigned)len);
+                return 0;
+            }
             return 0;
         }
-        goto error;
-
-    /* Unknown event */
+        
     default:
-        goto error;
+        return BLE_ATT_ERR_UNLIKELY;
     }
-
-error:
-    ESP_LOGE(
-        TAG,
-        "unexpected access operation characteristic, opcode: %d",
-        ctxt->op);
-    return BLE_ATT_ERR_UNLIKELY;
 }
 
 
@@ -148,20 +149,31 @@ void gatt_svr_register_cb(struct ble_gatt_register_ctxt *ctxt, void *arg) {
             0x67,0x45,0x23,0x01
         );
 
-        static const ble_uuid128_t audio_uuid = BLE_UUID128_INIT(
+        static const ble_uuid128_t audio_notify_uuid = BLE_UUID128_INIT(
             0xAA,0xBB,0xCC,0xDD,
             0xEE,0xFF,0x00,0x11,
             0x22,0x33,0x44,0x55,
             0x66,0x77,0x88,0x99
         );
 
+        static const ble_uuid128_t audio_write_uuid = BLE_UUID128_INIT(
+            0x4E, 0x5F, 0x6A, 0x8B,
+            0xCD, 0x12, 0x4F, 0xAB,
+            0x90, 0xDE, 0x12, 0x34,
+            0x56, 0x78, 0x90, 0xAB
+        );
+
         if (ble_uuid_cmp(ctxt->chr.chr_def->uuid, &wake_uuid.u) == 0) {
             wake_chr_handle = ctxt->chr.val_handle;
             ESP_LOGI(TAG, "Saved wake_chr_handle = %d", wake_chr_handle);
         }
-        if (ble_uuid_cmp(ctxt->chr.chr_def->uuid, &audio_uuid.u) == 0) {
-            audio_chr_handle = ctxt->chr.val_handle;
-            ESP_LOGI(TAG, "Saved audio_chr_handle = %d", audio_chr_handle);
+        if (ble_uuid_cmp(ctxt->chr.chr_def->uuid, &audio_notify_uuid.u) == 0) {
+            audio_notify_handle = ctxt->chr.val_handle;
+            ESP_LOGI(TAG, "Saved audio_notify_handle = %d", audio_notify_handle);
+        }
+        if (ble_uuid_cmp(ctxt->chr.chr_def->uuid, &audio_write_uuid.u) == 0) {
+            audio_write_handle = ctxt->chr.val_handle;
+            ESP_LOGI(TAG, "Saved audio_write_handle = %d", audio_write_handle);
         }
         break;
 

@@ -56,7 +56,6 @@ void bluetooth_init(void) {
     /* Local variables */
     int rc;
     esp_err_t ret;
-
  
     /*
      * NVS flash initialization
@@ -80,6 +79,8 @@ void bluetooth_init(void) {
                  ret);
         return;
     }
+
+    ble_att_set_preferred_mtu(500);
 
     /* GAP service initialization */
     rc = gap_init();
