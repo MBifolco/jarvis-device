@@ -2,47 +2,53 @@
    SPDX-License-Identifier: Unlicense OR CC0-1.0 */
 
 #include "audio_rx.h"
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-#include <stddef.h>
-#include <inttypes.h>
 #include "esp_log.h"
 #include "driver/i2s.h"
-#include "config.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/stream_buffer.h"
+#include "esp_heap_caps.h"    // for MALLOC_CAP_SPIRAM
+#include <stdlib.h>
+#include <string.h>
+#include <inttypes.h>
+
 static const char *TAG = "audio_rx";
 
-// I²S configuration — must match your encoding sample rate
+/* I2S + ADPCM → PCM parameters */
 #define I2S_SPK_PORT      I2S_NUM_1
 #define SAMPLE_RATE       24000
 #define BITS_PER_SAMPLE   16
 #define CHANNELS          1
 
-// Max duration we expect (seconds) × rate × channels
+/* Maximum capture length your app ever sends (seconds) */
 #define MAX_SECONDS       10
-#define MAX_SAMPLES       (SAMPLE_RATE * MAX_SECONDS)
+#define MAX_PCM_SAMPLES   (SAMPLE_RATE * MAX_SECONDS)
 
-// Global flag set true while playing back the buffered PCM
+/* StreamBuffer must hold entire compressed packet + 4-byte header */
+#define MAX_ADPCM_BYTES   (SAMPLE_RATE * CHANNELS * MAX_SECONDS / 2 + 4)
+#define SB_SIZE_BYTES     (MAX_ADPCM_BYTES * 2)  // double for safety
+#define SB_TRIGGER_LEVEL  1
+
+/* debug flag */
 bool g_playing_back = false;
 
-// ADPCM framing state
-static uint32_t adpcm_expected = 0;
-static uint32_t adpcm_received = 0;
-static bool     header_parsed  = false;
+/* the one StreamBuffer for raw ADPCM (incl. header) */
+static StreamBufferHandle_t    sb_adpcm          = NULL;
+// storage & control for that StreamBuffer, allocated in PSRAM
+static uint8_t               *sb_adpcm_mem      = NULL;
+static StaticStreamBuffer_t  *sb_adpcm_struct   = NULL;
 
-// Buffers
-static uint8_t  *adpcm_buffer = NULL;     // incoming ADPCM stream
-static int16_t  *pcm_accum    = NULL;     // decoded PCM
-static size_t    pcm_filled   = 0;
 
-// We need a flat buffer to accumulate the entire WAV (header+PCM) until play.
-static uint8_t  *wav_buffer     = NULL;
-static size_t    wav_filled     = 0;
-static size_t    wav_expected   = 0;
+/* PCM accumulator buffer */
+static int16_t *pcm_accum = NULL;
 
-#define MAX_WAV_BYTES  (44 + SAMPLE_RATE * CHANNELS * 2 * MAX_SECONDS)
+/* prototype */
+static void rx_task(void *arg);
+static size_t decode_adpcm_block(const uint8_t *in, size_t in_bytes, int16_t *out);
+static void play_pcm_chunk(const int16_t *pcm, size_t nsamps);
 
-// IMA-ADPCM tables
+
+// IMA-ADPCM step size table
 static const int step_table[89] = {
      7,   8,   9,  10,  11,  12,  13,  14,  16,  17,  19,  21,  23,  25,  28,  31,
     34,  37,  41,  45,  50,  55,  60,  66,  73,  80,  88,  97, 107, 118, 130, 143,
@@ -51,35 +57,171 @@ static const int step_table[89] = {
   3327,3660,4026,4428,4871,5358,5894,6484,7132,7845,8630,9493,10442,11487,12635,13899,
  15289,16818,18500,20350,22385,24623,27086,29794,32767
 };
+
+// IMA-ADPCM index adjustment table
 static const int index_table[16] = {
-   -1, -1, -1, -1, 2, 4, 6, 8,
-   -1, -1, -1, -1, 2, 4, 6, 8
+   -1, -1, -1, -1,  2,  4,  6,  8,
+   -1, -1, -1, -1,  2,  4,  6,  8
 };
 
-// Read 32-bit little-endian length header
-static uint32_t read_le32(const uint8_t *p) {
-    return ((uint32_t)p[0]) |
-           ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) |
-           ((uint32_t)p[3] << 24);
+/**
+ * @brief Set up buffers + spawn the RX task.
+ */
+esp_err_t audio_rx_init(void)
+{
+    /* 1) PCM decode buffer — allocate in PSRAM */
+    pcm_accum = heap_caps_malloc(
+        sizeof(int16_t) * MAX_PCM_SAMPLES,
+        MALLOC_CAP_SPIRAM
+    );
+    if (!pcm_accum) {
+        ESP_LOGE(TAG, "PSRAM alloc for pcm_accum failed");
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* 2) Raw ADPCM StreamBuffer — allocate its RAM & control struct in PSRAM */
+    sb_adpcm_mem    = heap_caps_malloc(SB_SIZE_BYTES,        MALLOC_CAP_SPIRAM);
+    sb_adpcm_struct = heap_caps_malloc(sizeof(StaticStreamBuffer_t),
+                                       MALLOC_CAP_SPIRAM);
+    if (!sb_adpcm_mem || !sb_adpcm_struct) {
+        ESP_LOGE(TAG, "PSRAM alloc for StreamBuffer failed");
+        heap_caps_free(pcm_accum);
+        heap_caps_free(sb_adpcm_mem);
+        heap_caps_free(sb_adpcm_struct);
+        return ESP_ERR_NO_MEM;
+    }
+    sb_adpcm = xStreamBufferCreateStatic(
+        SB_SIZE_BYTES,
+        SB_TRIGGER_LEVEL,
+        sb_adpcm_mem,
+        sb_adpcm_struct
+    );
+    if (!sb_adpcm) {
+        ESP_LOGE(TAG, "xStreamBufferCreateStatic failed");
+        free(pcm_accum);
+        heap_caps_free(sb_adpcm_mem);
+        heap_caps_free(sb_adpcm_struct);
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* 3) Start the background RX/decoder task */
+    xTaskCreate(
+        rx_task, "audio_rx", 4096,
+        NULL, tskIDLE_PRIORITY + 1, NULL
+    );
+
+    i2s_zero_dma_buffer(I2S_SPK_PORT);
+    i2s_set_clk(
+        I2S_SPK_PORT,
+        SAMPLE_RATE,      // now 24 kHz again
+        BITS_PER_SAMPLE,
+        CHANNELS
+    );
+
+    return ESP_OK;
 }
 
+/**
+ * @brief Enqueue BLE‐received bytes. Block up to 100 ms if full.
+ */
+esp_err_t audio_rx_on_write(const uint8_t *data, size_t len)
+{
+    size_t sent = xStreamBufferSend(sb_adpcm, data, len,
+                                   pdMS_TO_TICKS(100));
+    if (sent < len) {
+        ESP_LOGW(TAG, "StreamBuffer overflow dropped %u bytes",
+                 (unsigned)(len - sent));
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
+}
+
+/**
+ * @brief Task that:
+ *  - pulls exactly 4 bytes → reads total ADPCM length
+ *  - allocates a local buffer, pulls “length” bytes into it
+ *  - decodes into pcm_accum[]
+ *  - streams small PCM‐chunks to I2S
+ */
+static void rx_task(void *arg)
+{
+    uint8_t header[4];
+    for (;;) {
+        /* 1) read 4-byte length header */
+        xStreamBufferReceive(sb_adpcm, header, 4, portMAX_DELAY);
+        uint32_t expected = ((uint32_t)header[0])
+                          | ((uint32_t)header[1] << 8)
+                          | ((uint32_t)header[2] << 16)
+                          | ((uint32_t)header[3] << 24);
+
+        ESP_LOGI(TAG, "RX task: expecting %" PRIu32 " ADPCM bytes", expected);
+
+        uint8_t *adpcm_buf = malloc(expected);
+        if (!adpcm_buf) {
+            ESP_LOGE(TAG, "malloc adpcm_buf failed");
+            /* drain and skip */
+            size_t to_drain = expected;
+            while (to_drain) {
+                uint8_t tmp[256];
+                size_t r = xStreamBufferReceive(
+                    sb_adpcm, tmp,
+                    to_drain > sizeof(tmp) ? sizeof(tmp) : to_drain,
+                    portMAX_DELAY
+                );
+                to_drain -= r;
+            }
+            continue;
+        }
+
+        /* 2) read the full ADPCM payload */
+        size_t rec = 0;
+        while (rec < expected) {
+            rec += xStreamBufferReceive(
+                sb_adpcm,
+                adpcm_buf + rec,
+                expected - rec,
+                portMAX_DELAY
+            );
+        }
+
+        /* 3) decode block by block */
+        size_t pcm_filled = 0;
+        size_t off       = 0;
+        while (off < expected) {
+            size_t blk = (expected - off > 256) ? 256 : (expected - off);
+            size_t got = decode_adpcm_block(
+                adpcm_buf + off, blk,
+                pcm_accum + pcm_filled
+            );
+            /* 4) immediately play what we just decoded */
+            if (got) {
+                play_pcm_chunk(pcm_accum + pcm_filled, got);
+            }
+            pcm_filled += got;
+            off        += blk;
+        }
+
+        free(adpcm_buf);
+    }
+}
+
+/*———————————————————————————————*
+ |  IMA-ADPCM decoder & I2S writer |
+ *———————————————————————————————*/
+
+// clamp helper
 static inline int clamp_int(int v, int lo, int hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-// Decode one 256-byte (or smaller) ADPCM block → PCM samples
 static size_t decode_adpcm_block(const uint8_t *in, size_t in_bytes,
                                  int16_t *out)
 {
     if (in_bytes < 4) return 0;
     size_t out_cnt = 0;
-
-    const int16_t gate_threshold = 0;  // tweak this up or down
-
-    int16_t pred = (int16_t)((in[1] << 8) | in[0]);
-    int     idx  = in[2] & 0x7F;
-    out[out_cnt++] = (abs(pred) < gate_threshold) ? 0 : pred;;
+    int16_t pred   = (int16_t)((in[1] << 8) | in[0]);
+    int     idx    = in[2] & 0x7F;
+    out[out_cnt++] = pred;
 
     size_t i = 4;
     while (i < in_bytes) {
@@ -95,179 +237,32 @@ static size_t decode_adpcm_block(const uint8_t *in, size_t in_bytes,
 
             pred = (int16_t)clamp_int(pred + diff, -32768, 32767);
             idx  = clamp_int(idx + index_table[nib], 0, 88);
-            out[out_cnt++] = (abs(pred) < gate_threshold) ? 0 : pred;;
+            out[out_cnt++] = pred;
         }
     }
     return out_cnt;
 }
 
-// Initialize decoder state, buffers and I²S
-void audio_rx_init(void)
+static void play_pcm_chunk(const int16_t *pcm, size_t nsamps)
 {
-    header_parsed  = false;
-    adpcm_expected = 0;
-    adpcm_received = 0;
-    pcm_filled     = 0;
-
-    free(adpcm_buffer);
-    adpcm_buffer = NULL;
-
-    free(pcm_accum);
-    pcm_accum = malloc(sizeof(int16_t) * MAX_SAMPLES);
-
-    // configure I²S TX
-    i2s_zero_dma_buffer(I2S_SPK_PORT);
-    i2s_set_clk(I2S_SPK_PORT, SAMPLE_RATE, BITS_PER_SAMPLE, CHANNELS);
-}
-
-// Playback the entire decoded PCM at once
-void audio_rx_playback(void)
-{
-    if (pcm_filled == 0) return;
     g_playing_back = true;
 
-
-    ESP_LOGI(TAG, "Playing back %zu samples", pcm_filled);
-    size_t written = 0;
-    i2s_write(I2S_SPK_PORT,
-              pcm_accum,
-              pcm_filled * sizeof(int16_t),
-              &written,
-              portMAX_DELAY);
-    ESP_LOGI(TAG, "I2S wrote %zu bytes", written);
-
-    // reset state
-    pcm_filled     = 0;
-    header_parsed  = false;
-    adpcm_expected = 0;
-    adpcm_received = 0;
-    free(adpcm_buffer);
-    adpcm_buffer = NULL;
+    size_t total_bytes = nsamps * sizeof(int16_t);
+    size_t written     = 0;
+    esp_err_t err = i2s_write(
+        I2S_SPK_PORT,
+        (const uint8_t*)pcm,
+        total_bytes,
+        &written,
+        portMAX_DELAY     // block until it's handed off to DMA
+    );
+    if (err != ESP_OK || written != total_bytes) {
+        ESP_LOGW(TAG,
+                 "i2s_write wrote %u/%u bytes (err=%s)",
+                 (unsigned)written,
+                 (unsigned)total_bytes,
+                 esp_err_to_name(err));
+    }
 
     g_playing_back = false;
 }
-
-void audio_rx_on_write(const uint8_t *data, size_t len)
-{
-    if (config_get_compress_incoming()) {
-        // ── Compressed ADPCM Path ──
-
-        size_t offset = 0;
-        if (!header_parsed) {
-            if (len < 4) {
-                return;  // haven’t even got full ADPCM length header yet
-            }
-            adpcm_expected = read_le32(data);
-            header_parsed  = true;
-            adpcm_received = 0;
-            pcm_filled     = 0;
-
-            free(adpcm_buffer);
-            adpcm_buffer = malloc(adpcm_expected);
-            offset       = 4;
-
-            ESP_LOGI(TAG, "Expecting %" PRIu32 " ADPCM bytes", adpcm_expected);
-        }
-
-        size_t chunk = len - offset;
-        if (adpcm_received + chunk > adpcm_expected) {
-            chunk = adpcm_expected - adpcm_received;
-        }
-        memcpy(adpcm_buffer + adpcm_received, data + offset, chunk);
-        adpcm_received += chunk;
-
-        ESP_LOGD(TAG,
-                 "Received %" PRIu32 "/%" PRIu32 " ADPCM bytes",
-                 adpcm_received, adpcm_expected);
-
-        if (adpcm_received >= adpcm_expected) {
-            // We have a full ADPCM stream—decode and play once
-            size_t in_off = 0;
-            pcm_filled = 0;
-
-            while (in_off < adpcm_expected) {
-                size_t blk = (adpcm_expected - in_off >= 256) ? 256 : (adpcm_expected - in_off);
-                size_t got = decode_adpcm_block(adpcm_buffer + in_off, blk,
-                                                pcm_accum + pcm_filled);
-                pcm_filled += got;
-                in_off    += blk;
-            }
-
-            audio_rx_playback();
-
-            // Reset state for next ADPCM
-            header_parsed = false;
-            free(adpcm_buffer);
-            adpcm_buffer = NULL;
-        }
-
-    } else {
-        // ── Uncompressed WAV Path (old behavior) ──
-
-        // 1) Allocate the WAV buffer on first call
-        if (wav_buffer == NULL) {
-            wav_buffer   = malloc(MAX_WAV_BYTES);
-            wav_filled   = 0;
-            wav_expected = 0;
-        }
-
-        // 2) Copy incoming chunk into wav_buffer
-        if (wav_filled + len > MAX_WAV_BYTES) {
-            ESP_LOGW(TAG, "WAV overflow, resetting buffer");
-            wav_filled   = 0;
-            wav_expected = 0;
-        }
-        memcpy(wav_buffer + wav_filled, data, len);
-        wav_filled += len;
-        ESP_LOGD(TAG, "Received WAV chunk: %u bytes (filled=%u)",
-                 (unsigned)len, (unsigned)wav_filled);
-
-        // 3) If we haven’t parsed the WAV header yet, do so once we have ≥44 bytes
-        if (wav_expected == 0 && wav_filled >= 44) {
-            // bytes 24–27: sample rate, 4 bytes little‐endian
-            uint32_t sample_rate = read_le32(wav_buffer + 24);
-            ESP_LOGI(TAG,
-                     "WAV header: sample_rate=%u, channels=%u, bits/sample=%u",
-                     (unsigned)sample_rate, CHANNELS, BITS_PER_SAMPLE);
-
-            i2s_set_clk(I2S_SPK_PORT,
-                         sample_rate,
-                         BITS_PER_SAMPLE,
-                         CHANNELS);
-
-            // bytes 40–43: PCM data length, Little‐Endian
-            uint32_t data_len = read_le32(wav_buffer + 40);
-            wav_expected = 44 + data_len;
-            ESP_LOGI(TAG, "Expecting WAV total %u bytes", (unsigned)wav_expected);
-        }
-        
-        // 4) Once we've buffered the full WAV, play it as raw PCM
-        if (wav_expected > 0 && wav_filled >= wav_expected) {
-            ESP_LOGI(TAG, "Full WAV received (%u bytes), playing…",
-                     (unsigned)wav_filled);
-
-            const uint8_t *pcm    = wav_buffer + 44;
-            size_t        pcm_bytes = wav_expected - 44;
-
-            g_playing_back = true;
-            ESP_LOGI(TAG, "→ SPEAKER ON");
-
-            size_t written = 0;
-            ESP_ERROR_CHECK(i2s_write(I2S_SPK_PORT,
-                                     pcm,
-                                     pcm_bytes,
-                                     &written,
-                                     portMAX_DELAY));
-            ESP_LOGI(TAG, "i2s wrote %u PCM bytes", (unsigned)written);
-
-            g_playing_back = false;
-            ESP_LOGI(TAG, "← SPEAKER OFF");
-
-            // Reset for next WAV
-            wav_filled   = 0;
-            wav_expected = 0;
-        }
-    }
-}
-
-
