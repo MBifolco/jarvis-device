@@ -42,6 +42,8 @@ static StaticStreamBuffer_t  *sb_adpcm_struct   = NULL;
 /* PCM accumulator buffer */
 static int16_t *pcm_accum = NULL;
 
+static uint8_t *adpcm_buf;
+
 /* prototype */
 static void rx_task(void *arg);
 static size_t decode_adpcm_block(const uint8_t *in, size_t in_bytes, int16_t *out);
@@ -104,6 +106,16 @@ esp_err_t audio_rx_init(void)
         return ESP_ERR_NO_MEM;
     }
 
+    adpcm_buf = heap_caps_malloc(MAX_ADPCM_BYTES, MALLOC_CAP_SPIRAM);
+    if (!adpcm_buf) {
+        ESP_LOGE(TAG, "PSRAM alloc for adpcm_buf failed");
+        /* cleanup and return ESP_ERR_NO_MEM */
+        heap_caps_free(pcm_accum);
+        heap_caps_free(sb_adpcm_mem);
+        heap_caps_free(sb_adpcm_struct);
+        return ESP_ERR_NO_MEM;
+    }
+
     /* 3) Start the background RX/decoder task */
     xTaskCreate(
         rx_task, "audio_rx", 4096,
@@ -146,8 +158,9 @@ esp_err_t audio_rx_on_write(const uint8_t *data, size_t len)
 static void rx_task(void *arg)
 {
     uint8_t header[4];
+
     for (;;) {
-        /* 1) read 4-byte length header */
+        // 1) read 4-byte length header
         xStreamBufferReceive(sb_adpcm, header, 4, portMAX_DELAY);
         uint32_t expected = ((uint32_t)header[0])
                           | ((uint32_t)header[1] << 8)
@@ -156,24 +169,20 @@ static void rx_task(void *arg)
 
         ESP_LOGI(TAG, "RX task: expecting %" PRIu32 " ADPCM bytes", expected);
 
-        uint8_t *adpcm_buf = malloc(expected);
-        if (!adpcm_buf) {
-            ESP_LOGE(TAG, "malloc adpcm_buf failed");
-            /* drain and skip */
+        // 2) too large? drain and skip
+        if (expected > MAX_ADPCM_BYTES) {
+            ESP_LOGW(TAG, "Packet too big (%" PRIu32 "), skipping", expected);
             size_t to_drain = expected;
             while (to_drain) {
                 uint8_t tmp[256];
-                size_t r = xStreamBufferReceive(
-                    sb_adpcm, tmp,
-                    to_drain > sizeof(tmp) ? sizeof(tmp) : to_drain,
-                    portMAX_DELAY
-                );
+                size_t chunk = to_drain > sizeof(tmp) ? sizeof(tmp) : to_drain;
+                size_t r = xStreamBufferReceive(sb_adpcm, tmp, chunk, portMAX_DELAY);
                 to_drain -= r;
             }
             continue;
         }
 
-        /* 2) read the full ADPCM payload */
+        // 3) read the full ADPCM payload into our pre-alloc’d buffer
         size_t rec = 0;
         while (rec < expected) {
             rec += xStreamBufferReceive(
@@ -184,24 +193,24 @@ static void rx_task(void *arg)
             );
         }
 
-        /* 3) decode block by block */
-        size_t pcm_filled = 0;
-        size_t off       = 0;
+        // 4) DECODE ALL BLOCKS into pcm_accum[]
+        size_t pcm_count = 0;
+        size_t off = 0;
         while (off < expected) {
             size_t blk = (expected - off > 256) ? 256 : (expected - off);
             size_t got = decode_adpcm_block(
-                adpcm_buf + off, blk,
-                pcm_accum + pcm_filled
+                adpcm_buf + off,
+                blk,
+                pcm_accum + pcm_count
             );
-            /* 4) immediately play what we just decoded */
-            if (got) {
-                play_pcm_chunk(pcm_accum + pcm_filled, got);
-            }
-            pcm_filled += got;
-            off        += blk;
+            pcm_count += got;
+            off       += blk;
         }
 
-        free(adpcm_buf);
+        // 5) PLAY it back in one go (with internal chunking for DMA)
+        if (pcm_count) {
+            play_pcm_chunk(pcm_accum, pcm_count);
+        }
     }
 }
 
