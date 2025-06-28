@@ -46,19 +46,27 @@ static task_info_t s_info;
 static void keep_alive_callback(TimerHandle_t xTimer)
 {
     task_info_t *info = (task_info_t *)pvTimerGetTimerID(xTimer);
-    ESP_LOGI(TAG, "Keep-alive expired, disarming");
 
+    if (g_playing_back) {
+        ESP_LOGI(TAG, "Playback in progress, deferring keep-alive");
+        xTimerReset(xTimer, 0);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Keep-alive expired, disarming");
     keepalive_disable();
 
     if (!info->using_wake) {
-        info->iface_hold->destroy(info->data_hold);
-        info->data_hold = info->iface_hold->create_from_config(info->cfg_hold);
-
+        // 1) Flip over to the wake-word pipeline immediately
         info->iface      = info->iface_wake;
         info->data       = info->data_wake;
         info->using_wake = true;
-
         ESP_LOGI(TAG, "Switched back to wake-word VAD after keep-alive");
+
+        // 2) Now that feed_task() will no longer touch the “hold” instance,
+        //    it’s safe to destroy & re-create it:
+        info->iface_hold->destroy(info->data_hold);
+        info->data_hold = info->iface_hold->create_from_config(info->cfg_hold);
     }
 }
 
