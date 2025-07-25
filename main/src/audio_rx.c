@@ -21,7 +21,7 @@ static const char *TAG = "audio_rx";
 #define CHANNELS          1
 
 /* Maximum capture length your app ever sends (seconds) */
-#define MAX_SECONDS       10
+#define MAX_SECONDS       5
 #define MAX_PCM_SAMPLES   (SAMPLE_RATE * MAX_SECONDS)
 
 /* StreamBuffer must hold entire compressed packet + 4-byte header */
@@ -256,22 +256,36 @@ static void play_pcm_chunk(const int16_t *pcm, size_t nsamps)
 {
     g_playing_back = true;
 
-    size_t total_bytes = nsamps * sizeof(int16_t);
-    size_t written     = 0;
-    esp_err_t err = i2s_write(
-        I2S_SPK_PORT,
-        (const uint8_t*)pcm,
-        total_bytes,
-        &written,
-        portMAX_DELAY     // block until it's handed off to DMA
-    );
-    if (err != ESP_OK || written != total_bytes) {
-        ESP_LOGW(TAG,
-                 "i2s_write wrote %u/%u bytes (err=%s)",
-                 (unsigned)written,
-                 (unsigned)total_bytes,
-                 esp_err_to_name(err));
+    const uint8_t *data       = (const uint8_t*)pcm;
+    size_t         total_bytes = nsamps * sizeof(int16_t);
+    size_t         offset      = 0;
+    const size_t   CHUNK       = 4096;  // 4 KB
+
+    while (offset < total_bytes) {
+        size_t to_write = (total_bytes - offset > CHUNK)
+                            ? CHUNK
+                            : (total_bytes - offset);
+        size_t written = 0;
+        esp_err_t err = i2s_write(
+            I2S_SPK_PORT,
+            data + offset,
+            to_write,
+            &written,
+            pdMS_TO_TICKS(20)      // give up quickly if DMA is backed up
+        );
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "i2s_write error: %s", esp_err_to_name(err));
+            break;
+        }
+        if (written < to_write) {
+            ESP_LOGW(TAG, "i2s_write wrote only %u/%u bytes",
+                     (unsigned)written, (unsigned)to_write);
+        }
+        offset += written;
+        // yield so BLE/VAD tasks don’t starve
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 
     g_playing_back = false;
 }
+

@@ -20,13 +20,13 @@ typedef enum {
 #define MIN_RECORD_SAMPLES (SAMPLE_RATE / 1)  // 1 second at 16 kHz
 #define KEEP_ALIVE_MS      (20000)          // 20-second keep-alive window
 
-#define MIC_BCK_IO        GPIO_NUM_5
-#define MIC_WS_IO         GPIO_NUM_6
-#define MIC_DATA_IO       GPIO_NUM_4
+#define MIC_BCK_IO        GPIO_NUM_8 // SCK
+#define MIC_WS_IO         GPIO_NUM_10 // WS
+#define MIC_DATA_IO       GPIO_NUM_9 // SD
 
-#define SPK_BCK_IO        GPIO_NUM_10
-#define SPK_WS_IO         GPIO_NUM_11
-#define SPK_DATA_IO       GPIO_NUM_9
+#define SPK_BCK_IO        GPIO_NUM_6 // BCLK
+#define SPK_WS_IO         GPIO_NUM_5 //LRC
+#define SPK_DATA_IO       GPIO_NUM_7 // DIN
 
 #define I2S_MIC_PORT      I2S_NUM_0
 #define I2S_SPK_PORT      I2S_NUM_1

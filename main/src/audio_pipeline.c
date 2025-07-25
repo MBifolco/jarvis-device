@@ -38,11 +38,20 @@ size_t audio_pipeline_get_buf_filled(void)             { return s_buf_filled; }
 void   audio_pipeline_set_buf_filled(size_t filled)    { s_buf_filled = filled; }
 
 int16_t *audio_pipeline_get_mono_buf(void)             { return s_mono_buf; }
-int16_t *audio_pipeline_alloc_mono_buf(size_t capacity){
-    if (s_mono_buf) free(s_mono_buf);
-    s_mono_buf = malloc(sizeof(int16_t)*capacity);
+
+int16_t *audio_pipeline_alloc_mono_buf(size_t capacity)
+{
+    if (s_mono_buf) {
+        heap_caps_free(s_mono_buf);
+    }
+    s_mono_buf = heap_caps_malloc(
+        sizeof(int16_t) * capacity,
+        MALLOC_CAP_SPIRAM
+    );
+    assert(s_mono_buf);
     return s_mono_buf;
 }
+
 void    audio_pipeline_free_mono_buf(void){
     if (s_mono_buf) {
         free(s_mono_buf);

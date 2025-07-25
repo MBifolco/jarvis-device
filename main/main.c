@@ -57,16 +57,16 @@ static void keep_alive_callback(TimerHandle_t xTimer)
     keepalive_disable();
 
     if (!info->using_wake) {
-        // 1) Flip over to the wake-word pipeline immediately
+        // 1) Flip over to wake pipeline
         info->iface      = info->iface_wake;
         info->data       = info->data_wake;
         info->using_wake = true;
-        ESP_LOGI(TAG, "Switched back to wake-word VAD after keep-alive");
 
-        // 2) Now that feed_task() will no longer touch the “hold” instance,
-        //    it’s safe to destroy & re-create it:
+        // 2) Now safe to tear down & rebuild the hold instance
         info->iface_hold->destroy(info->data_hold);
         info->data_hold = info->iface_hold->create_from_config(info->cfg_hold);
+ 
+        ESP_LOGI(TAG, "Switched back to wake-word VAD after keep-alive");
     }
 }
 
@@ -178,8 +178,8 @@ void app_main(void)
     s_info.data        = data_wake;
     s_info.using_wake  = true;
 
-    xTaskCreate(feed_task,  "feed",  4096, &s_info, 5, &feed_handle);
-    xTaskCreate(fetch_task, "fetch", 4096, &s_info, 5, NULL);
+    xTaskCreate(feed_task,  "feed",  8192, &s_info, 5, &feed_handle);
+    xTaskCreate(fetch_task, "fetch", 8192, &s_info, 5, NULL);
 
     tone_play(1000, 100, 50);
     ESP_LOGI(TAG, "Ready—say the wake word!");
