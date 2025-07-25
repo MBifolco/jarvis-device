@@ -105,14 +105,14 @@ esp_err_t audio_tx_send(const uint8_t *pcm, size_t len)
     uint8_t *outbuf = malloc(out_frame_size);
     if (!inbuf || !outbuf) {
         ESP_LOGE(TAG, "Failed to allocate compression buffers");
-        free(inbuf); free(outbuf);
+        heap_caps_free(inbuf); heap_caps_free(outbuf);
         return ESP_ERR_NO_MEM;
     }
 
     uint8_t *adpcm_buf = malloc(len);
     if (!adpcm_buf) {
         ESP_LOGE(TAG, "Failed to allocate ADPCM buffer");
-        free(inbuf); free(outbuf);
+        heap_caps_free(inbuf); heap_caps_free(outbuf);
         return ESP_ERR_NO_MEM;
     }
 
@@ -184,8 +184,8 @@ esp_err_t audio_tx_send(const uint8_t *pcm, size_t len)
     ESP_LOGI(TAG, "Audio transmission complete (ADPCM, %d bytes total)", (int)(adpcm_offset + WAV_HEADER_SIZE));
 
 cleanup:
-    free(inbuf);
-    free(outbuf);
-    free(adpcm_buf);
+    heap_caps_free(inbuf);
+    heap_caps_free(outbuf);
+    heap_caps_free(adpcm_buf);
     return ESP_OK;
 }

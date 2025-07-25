@@ -33,6 +33,6 @@ esp_err_t tone_play(uint32_t freq_hz, uint32_t ms, uint8_t vol) {
       portMAX_DELAY
     );
 
-    free(buf);
+    heap_caps_free(buf);
     return err;
 }

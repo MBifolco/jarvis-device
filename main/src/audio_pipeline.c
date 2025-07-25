@@ -54,7 +54,7 @@ int16_t *audio_pipeline_alloc_mono_buf(size_t capacity)
 
 void    audio_pipeline_free_mono_buf(void){
     if (s_mono_buf) {
-        free(s_mono_buf);
+        heap_caps_free(s_mono_buf);
         s_mono_buf = NULL;
     }
 }

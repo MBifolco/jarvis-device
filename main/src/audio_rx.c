@@ -100,7 +100,7 @@ esp_err_t audio_rx_init(void)
     );
     if (!sb_adpcm) {
         ESP_LOGE(TAG, "xStreamBufferCreateStatic failed");
-        free(pcm_accum);
+        heap_caps_free(pcm_accum);
         heap_caps_free(sb_adpcm_mem);
         heap_caps_free(sb_adpcm_struct);
         return ESP_ERR_NO_MEM;
