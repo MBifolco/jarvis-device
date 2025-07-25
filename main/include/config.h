@@ -16,7 +16,7 @@ typedef enum {
 } config_id_t;
 
 #define SAMPLE_RATE       16000
-#define POST_WAKE_SECONDS 30           // max record length
+#define POST_WAKE_SECONDS 8            // max record length - conservative for PSRAM limits
 #define MIN_RECORD_SAMPLES (SAMPLE_RATE / 1)  // 1 second at 16 kHz
 #define KEEP_ALIVE_MS      (20000)          // 20-second keep-alive window
 
