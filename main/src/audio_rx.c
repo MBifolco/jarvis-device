@@ -259,7 +259,7 @@ static void play_pcm_chunk(const int16_t *pcm, size_t nsamps)
     const uint8_t *data       = (const uint8_t*)pcm;
     size_t         total_bytes = nsamps * sizeof(int16_t);
     size_t         offset      = 0;
-    const size_t   CHUNK       = 4096;  // 4 KB
+    const size_t   CHUNK       = 1024;  // 1 KB - smaller chunks for better flow control
 
     while (offset < total_bytes) {
         size_t to_write = (total_bytes - offset > CHUNK)
@@ -271,7 +271,7 @@ static void play_pcm_chunk(const int16_t *pcm, size_t nsamps)
             data + offset,
             to_write,
             &written,
-            pdMS_TO_TICKS(20)      // give up quickly if DMA is backed up
+            pdMS_TO_TICKS(100)     // longer timeout for DMA buffer to drain
         );
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "i2s_write error: %s", esp_err_to_name(err));

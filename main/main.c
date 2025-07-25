@@ -79,7 +79,9 @@ static void feed_task(void *arg)
     int  chunksize     = info->iface->get_feed_chunksize(info->data);
     int  channels      = info->iface->get_feed_channel_num(info->data);
     size_t frame_bytes = chunksize * channels * sizeof(int16_t);
-    int16_t *i2s_buf   = malloc(frame_bytes);
+    
+    // Allocate I2S buffer on stack to avoid memory leak
+    int16_t i2s_buf[chunksize * channels];
 
     ESP_LOGI(TAG, "feed_task started (chunk=%d, channels=%d)", chunksize, channels);
     while (1) {

@@ -43,12 +43,16 @@ int16_t *audio_pipeline_alloc_mono_buf(size_t capacity)
 {
     if (s_mono_buf) {
         heap_caps_free(s_mono_buf);
+        s_mono_buf = NULL;
     }
     s_mono_buf = heap_caps_malloc(
         sizeof(int16_t) * capacity,
         MALLOC_CAP_SPIRAM
     );
-    assert(s_mono_buf);
+    if (!s_mono_buf) {
+        ESP_LOGE(TAG, "Failed to allocate mono buffer (%zu bytes)", sizeof(int16_t) * capacity);
+        return NULL;
+    }
     return s_mono_buf;
 }
 
@@ -70,12 +74,15 @@ void audio_pipeline_handle_vad(afe_fetch_result_t *res, TimerHandle_t keepAliveT
             if (keepalive_is_enabled() && !audio_pipeline_is_recording()) {
                 xTimerStop(keepAliveTimer, 0);
                 keepalive_disable();
-                audio_pipeline_alloc_mono_buf(audio_pipeline_get_buf_capacity());
-                audio_pipeline_set_buf_filled(0);
-                audio_pipeline_set_stop_record(false);
-                audio_pipeline_set_recording(true);
-                audio_pipeline_set_seen_speech(true);
-                ESP_LOGI(TAG, "Re-armed recording during keep-alive");
+                if (audio_pipeline_alloc_mono_buf(audio_pipeline_get_buf_capacity()) != NULL) {
+                    audio_pipeline_set_buf_filled(0);
+                    audio_pipeline_set_stop_record(false);
+                    audio_pipeline_set_recording(true);
+                    audio_pipeline_set_seen_speech(true);
+                    ESP_LOGI(TAG, "Re-armed recording during keep-alive");
+                } else {
+                    ESP_LOGE(TAG, "Failed to allocate buffer for keep-alive recording");
+                }
             }
         } else {
             if (audio_pipeline_is_recording()
