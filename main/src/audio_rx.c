@@ -21,7 +21,7 @@ static const char *TAG = "audio_rx";
 #define CHANNELS          1
 
 /* Maximum capture length your app ever sends (seconds) */
-#define MAX_SECONDS       5
+#define MAX_SECONDS       6
 #define MAX_PCM_SAMPLES   (SAMPLE_RATE * MAX_SECONDS)
 
 /* StreamBuffer must hold entire compressed packet + 4-byte header */
@@ -116,10 +116,10 @@ esp_err_t audio_rx_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    /* 3) Start the background RX/decoder task */
-    xTaskCreate(
+    /* 3) Start the background RX/decoder task - high priority, pinned to Core 1 */
+    xTaskCreatePinnedToCore(
         rx_task, "audio_rx", 4096,
-        NULL, tskIDLE_PRIORITY + 1, NULL
+        NULL, 6, NULL, 1  // Priority 6, Core 1
     );
 
     i2s_zero_dma_buffer(I2S_SPK_PORT);
