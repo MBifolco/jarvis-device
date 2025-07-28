@@ -47,8 +47,12 @@ static StaticStreamBuffer_t  *sb_adpcm_struct   = NULL;
 /* PCM playback queue - sends decoded PCM chunks to playback task */
 static QueueHandle_t pcm_queue = NULL;
 
-/* Dynamic PCM decode buffer - allocated per processing cycle */
+/* Pre-allocated chunk pool to avoid fragmentation */
+#define CHUNK_POOL_SIZE 12  // 12 seconds of chunks (576KB) - balance between AFE and streaming
+static int16_t *chunk_pool[CHUNK_POOL_SIZE];
+static bool chunk_pool_used[CHUNK_POOL_SIZE];
 
+/* Dynamic PCM decode buffer - allocated per processing cycle */
 static uint8_t *audio_buf;
 
 /* PCM chunk for queue */
@@ -64,6 +68,8 @@ static void process_compressed_audio(uint32_t expected);
 static void process_uncompressed_audio(uint32_t expected);
 static size_t decode_adpcm_block(const uint8_t *in, size_t in_bytes, int16_t *out);
 static void play_pcm_chunk(const int16_t *pcm, size_t nsamps);
+static int16_t* allocate_chunk(void);
+static void free_chunk(int16_t* chunk);
 
 
 // IMA-ADPCM step size table
@@ -121,20 +127,35 @@ esp_err_t audio_rx_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    /* 3) Create PCM queue for communication between rx and playback tasks - larger for 1-sec chunks */
+    /* 3) Initialize chunk pool to avoid fragmentation */
+    for (int i = 0; i < CHUNK_POOL_SIZE; i++) {
+        chunk_pool[i] = heap_caps_malloc(SAMPLE_RATE * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+        if (!chunk_pool[i]) {
+            ESP_LOGE(TAG, "Failed to allocate chunk pool entry %d", i);
+            // Free already allocated chunks
+            for (int j = 0; j < i; j++) {
+                heap_caps_free(chunk_pool[j]);
+            }
+            return ESP_ERR_NO_MEM;
+        }
+        chunk_pool_used[i] = false;
+    }
+    ESP_LOGI(TAG, "Allocated chunk pool: %d chunks x %d samples", CHUNK_POOL_SIZE, SAMPLE_RATE);
+
+    /* 4) Create PCM queue for communication between rx and playback tasks */
     pcm_queue = xQueueCreate(16, sizeof(pcm_chunk_t));
     if (!pcm_queue) {
         ESP_LOGE(TAG, "Failed to create PCM queue");
         return ESP_ERR_NO_MEM;
     }
 
-    /* 4) Start the playback task - highest priority for uninterrupted I2S writes */
+    /* 5) Start the playback task - highest priority for uninterrupted I2S writes */
     xTaskCreate(
         playback_task, "audio_play", 4096,
         NULL, 7, NULL  // Highest priority 7
     );
 
-    /* 5) Start the RX/decoder task - normal priority with larger stack for streaming */
+    /* 6) Start the RX/decoder task - normal priority with larger stack for streaming */
     xTaskCreate(
         rx_task, "audio_rx", 8192,  // Increased from 4096 to 8192 for streaming
         NULL, 5, NULL  // Priority 5 (same as other tasks)
@@ -190,6 +211,23 @@ static void rx_task(void *arg)
         // Log the header bytes for debugging
         ESP_LOGI(TAG, "Header bytes: [0x%02X, 0x%02X, 0x%02X, 0x%02X]", 
                 header[0], header[1], header[2], header[3]);
+
+        // CRITICAL: Validate header to detect corruption from overlapping BLE transmissions
+        // Reasonable audio chunks are 1KB to 500KB (compressed or uncompressed)
+        if (expected < 1000 || expected > 500000) {
+            ESP_LOGW(TAG, "🚨 CORRUPTED HEADER DETECTED! Expected: %" PRIu32 " bytes - FLUSHING STREAM BUFFER", expected);
+            
+            // Flush the entire stream buffer to resync
+            size_t flushed = 0;
+            uint8_t flush_buf[1024];
+            while (xStreamBufferBytesAvailable(sb_adpcm) > 0) {
+                size_t chunk_size = xStreamBufferReceive(sb_adpcm, flush_buf, sizeof(flush_buf), pdMS_TO_TICKS(10));
+                if (chunk_size == 0) break;  // Timeout - buffer is empty
+                flushed += chunk_size;
+            }
+            ESP_LOGW(TAG, "🧹 Flushed %" PRIu32 " bytes from corrupted stream - waiting for next transmission", (uint32_t)flushed);
+            continue;  // Wait for next header
+        }
 
 
         // 2) Check config to determine processing method
@@ -362,13 +400,18 @@ static void process_uncompressed_audio(uint32_t expected)
         total_received += received;
         buffer_used += received;
         
+        // Yield more frequently for very long audio to prevent watchdog
+        if (total_received % (SAMPLE_RATE * 10) == 0) {  // Every ~5 seconds
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+        
         // Queue chunks as soon as we have enough data
         while (buffer_used >= CHUNK_BYTES || (total_received >= expected && buffer_used > 0)) {
             size_t chunk_bytes = (buffer_used >= CHUNK_BYTES) ? CHUNK_BYTES : buffer_used;
             size_t chunk_samples = chunk_bytes / sizeof(int16_t);
             
-            int16_t *chunk_data = heap_caps_malloc(chunk_samples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-            if (chunk_data) {
+            int16_t *chunk_data = allocate_chunk();
+            if (chunk_data && chunk_samples <= SAMPLE_RATE) {
                 memcpy(chunk_data, stream_buffer, chunk_bytes);
                 pcm_chunk_t chunk = { .data = chunk_data, .samples = chunk_samples };
                 
@@ -392,9 +435,14 @@ static void process_uncompressed_audio(uint32_t expected)
                 if (buffer_used > 0) {
                     memmove(stream_buffer, stream_buffer + chunk_bytes, buffer_used);
                 }
+                
+                // Yield to prevent watchdog timeout
+                vTaskDelay(pdMS_TO_TICKS(1));
             } else {
-                ESP_LOGE(TAG, "Failed to allocate chunk memory");
-                break;
+                ESP_LOGW(TAG, "Chunk pool exhausted - waiting for free chunks");
+                // Shorter wait to minimize audio gaps
+                vTaskDelay(pdMS_TO_TICKS(10));
+                // Don't advance buffer - try again with same data
             }
         }
         
@@ -432,8 +480,8 @@ static void playback_task(void *arg)
             // Play the chunk with dedicated I2S writing
             play_pcm_chunk(chunk.data, chunk.samples);
             
-            // Free the chunk memory
-            heap_caps_free(chunk.data);
+            // Return chunk to pool
+            free_chunk(chunk.data);
             
             // Clear flag when done
             g_playing_back = false;
@@ -514,5 +562,34 @@ static void play_pcm_chunk(const int16_t *pcm, size_t nsamps)
     }
 
     g_playing_back = false;
+}
+
+/**
+ * @brief Allocate a chunk from the pre-allocated pool
+ */
+static int16_t* allocate_chunk(void)
+{
+    for (int i = 0; i < CHUNK_POOL_SIZE; i++) {
+        if (!chunk_pool_used[i]) {
+            chunk_pool_used[i] = true;
+            return chunk_pool[i];
+        }
+    }
+    return NULL;  // Pool exhausted
+}
+
+/**
+ * @brief Return a chunk to the pool
+ */
+static void free_chunk(int16_t* chunk)
+{
+    for (int i = 0; i < CHUNK_POOL_SIZE; i++) {
+        if (chunk_pool[i] == chunk) {
+            chunk_pool_used[i] = false;
+            return;
+        }
+    }
+    // Should never happen - log error
+    ESP_LOGE(TAG, "Attempted to free unknown chunk %p", chunk);
 }
 
