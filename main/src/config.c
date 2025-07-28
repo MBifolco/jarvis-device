@@ -7,7 +7,7 @@
 static const char *TAG = "config";
 
 //––– Local storage of each setting –––
-static bool   s_compress_incoming  = true;
+static bool   s_compress_incoming  = false;
 static bool   s_send_debug_drops   = false;
 static uint16_t s_led_brightness   = 0;
 static bool   s_play_on_device     = true; 

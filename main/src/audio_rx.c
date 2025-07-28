@@ -2,6 +2,7 @@
    SPDX-License-Identifier: Unlicense OR CC0-1.0 */
 
 #include "audio_rx.h"
+#include "config.h"
 #include "esp_log.h"
 #include "driver/i2s.h"
 #include "freertos/FreeRTOS.h"
@@ -24,9 +25,14 @@ static const char *TAG = "audio_rx";
 #define MAX_SECONDS       18
 #define DECODE_CHUNK_SIZE (SAMPLE_RATE * 2)  // 2 seconds of PCM for decode buffer
 
-/* StreamBuffer must hold entire compressed packet + 4-byte header */
-#define MAX_ADPCM_BYTES   (SAMPLE_RATE * CHANNELS * MAX_SECONDS / 2 + 4)
-#define SB_SIZE_BYTES     (MAX_ADPCM_BYTES * 2)  // double for safety
+/* StreamBuffer sizing - much smaller than full audio */
+#define MAX_ADPCM_BYTES   (SAMPLE_RATE * CHANNELS * MAX_SECONDS / 2 + 4)  // ~216KB for 18s compressed
+#define STREAM_BUFFER_SECONDS 3  // Only need 3 seconds for BLE smoothing
+#define STREAM_BUFFER_PCM_BYTES (SAMPLE_RATE * CHANNELS * STREAM_BUFFER_SECONDS * 2)  // 3s of PCM
+/* StreamBuffer needs to handle the larger of: full compressed packet OR 3s of uncompressed */
+#define SB_SIZE_BYTES     ((MAX_ADPCM_BYTES > STREAM_BUFFER_PCM_BYTES) ? MAX_ADPCM_BYTES * 2 : STREAM_BUFFER_PCM_BYTES * 2)
+/* Audio processing buffer only needed for compressed (uncompressed streams directly) */
+#define AUDIO_BUF_SIZE    (MAX_ADPCM_BYTES)  // Only for compressed audio buffering
 #define SB_TRIGGER_LEVEL  1
 
 /* debug flag */
@@ -43,7 +49,7 @@ static QueueHandle_t pcm_queue = NULL;
 
 /* Dynamic PCM decode buffer - allocated per processing cycle */
 
-static uint8_t *adpcm_buf;
+static uint8_t *audio_buf;
 
 /* PCM chunk for queue */
 typedef struct {
@@ -54,6 +60,8 @@ typedef struct {
 /* prototype */
 static void rx_task(void *arg);
 static void playback_task(void *arg);
+static void process_compressed_audio(uint32_t expected);
+static void process_uncompressed_audio(uint32_t expected);
 static size_t decode_adpcm_block(const uint8_t *in, size_t in_bytes, int16_t *out);
 static void play_pcm_chunk(const int16_t *pcm, size_t nsamps);
 
@@ -104,9 +112,9 @@ esp_err_t audio_rx_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    adpcm_buf = heap_caps_malloc(MAX_ADPCM_BYTES, MALLOC_CAP_SPIRAM);
-    if (!adpcm_buf) {
-        ESP_LOGE(TAG, "PSRAM alloc for adpcm_buf failed");
+    audio_buf = heap_caps_malloc(AUDIO_BUF_SIZE, MALLOC_CAP_SPIRAM);
+    if (!audio_buf) {
+        ESP_LOGE(TAG, "PSRAM alloc for audio_buf failed");
         /* cleanup and return ESP_ERR_NO_MEM */
         heap_caps_free(sb_adpcm_mem);
         heap_caps_free(sb_adpcm_struct);
@@ -126,9 +134,9 @@ esp_err_t audio_rx_init(void)
         NULL, 7, NULL  // Highest priority 7
     );
 
-    /* 5) Start the RX/decoder task - normal priority */
+    /* 5) Start the RX/decoder task - normal priority with larger stack for streaming */
     xTaskCreate(
-        rx_task, "audio_rx", 4096,
+        rx_task, "audio_rx", 8192,  // Increased from 4096 to 8192 for streaming
         NULL, 5, NULL  // Priority 5 (same as other tasks)
     );
 
@@ -160,10 +168,10 @@ esp_err_t audio_rx_on_write(const uint8_t *data, size_t len)
 
 /**
  * @brief Task that:
- *  - pulls exactly 4 bytes → reads total ADPCM length
- *  - allocates a local buffer, pulls “length” bytes into it
- *  - decodes into pcm_accum[]
- *  - streams small PCM‐chunks to I2S
+ *  - pulls exactly 4 bytes → reads total audio data length
+ *  - determines if data is ADPCM (compressed) or PCM (uncompressed)
+ *  - decodes ADPCM or directly plays PCM
+ *  - streams PCM chunks to I2S
  */
 static void rx_task(void *arg)
 {
@@ -177,141 +185,229 @@ static void rx_task(void *arg)
                           | ((uint32_t)header[2] << 16)
                           | ((uint32_t)header[3] << 24);
 
-        ESP_LOGI(TAG, "RX task: expecting %" PRIu32 " ADPCM bytes", expected);
+        ESP_LOGI(TAG, "RX task: expecting %" PRIu32 " audio bytes", expected);
+        
+        // Log the header bytes for debugging
+        ESP_LOGI(TAG, "Header bytes: [0x%02X, 0x%02X, 0x%02X, 0x%02X]", 
+                header[0], header[1], header[2], header[3]);
 
-        // 2) too large? drain and skip
-        if (expected > MAX_ADPCM_BYTES) {
-            ESP_LOGW(TAG, "Packet too big (%" PRIu32 "), skipping", expected);
-            size_t to_drain = expected;
-            while (to_drain) {
-                uint8_t tmp[256];
-                size_t chunk = to_drain > sizeof(tmp) ? sizeof(tmp) : to_drain;
-                size_t r = xStreamBufferReceive(sb_adpcm, tmp, chunk, portMAX_DELAY);
-                to_drain -= r;
+
+        // 2) Check config to determine processing method
+        bool is_compressed = config_get_compress_incoming();
+        
+        if (is_compressed) {
+            // 3) For compressed audio, check size limit since we buffer it all
+            if (expected > MAX_ADPCM_BYTES) {
+                ESP_LOGW(TAG, "Compressed packet too big (%" PRIu32 " > %d), skipping", expected, MAX_ADPCM_BYTES);
+                size_t to_drain = expected;
+                while (to_drain) {
+                    uint8_t tmp[256];
+                    size_t chunk = to_drain > sizeof(tmp) ? sizeof(tmp) : to_drain;
+                    size_t r = xStreamBufferReceive(sb_adpcm, tmp, chunk, portMAX_DELAY);
+                    to_drain -= r;
+                }
+                continue;
             }
-            continue;
+            process_compressed_audio(expected);
+        } else {
+            // 3) For uncompressed audio, no size limit needed since we stream it
+            process_uncompressed_audio(expected);
         }
+    }
+}
 
-        // 3) Allocate small dynamic decode buffer
-        int16_t *decode_buf = heap_caps_malloc(DECODE_CHUNK_SIZE * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-        if (!decode_buf) {
-            ESP_LOGE(TAG, "Failed to allocate decode buffer");
-            continue;
-        }
-        
-        // 4) Progressive receive, decode, and queue as data arrives
-        size_t total_received = 0;
-        size_t decode_offset = 0;
-        size_t pcm_accumulated = 0;
-        int chunk_num = 1;
-        const size_t CHUNK_SIZE = SAMPLE_RATE;  // 1 second at 24kHz
-        
-        while (total_received < expected) {
-            // Read incoming ADPCM data in small chunks
-            size_t to_read = (expected - total_received > 2048) ? 2048 : (expected - total_received);
-            size_t received = xStreamBufferReceive(
-                sb_adpcm,
-                adpcm_buf + total_received,
-                to_read,
-                portMAX_DELAY
+/**
+ * @brief Process compressed ADPCM audio - receive all data first, then decode
+ */
+static void process_compressed_audio(uint32_t expected)
+{
+    ESP_LOGI(TAG, "Processing compressed ADPCM audio");
+    
+    // Receive all ADPCM data first
+    size_t total_received = 0;
+    while (total_received < expected) {
+        size_t to_read = (expected - total_received > 2048) ? 2048 : (expected - total_received);
+        size_t received = xStreamBufferReceive(
+            sb_adpcm,
+            audio_buf + total_received,
+            to_read,
+            portMAX_DELAY
+        );
+        total_received += received;
+    }
+    
+    // Allocate decode buffer for ADPCM processing
+    int16_t *decode_buf = heap_caps_malloc(DECODE_CHUNK_SIZE * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (!decode_buf) {
+        ESP_LOGE(TAG, "Failed to allocate decode buffer");
+        return;
+    }
+    
+    // Decode ADPCM and queue PCM chunks
+    size_t decode_offset = 0;
+    size_t pcm_accumulated = 0;
+    int chunk_num = 1;
+    const size_t CHUNK_SIZE = SAMPLE_RATE;  // 1 second at 24kHz
+    
+    while (decode_offset + 256 <= expected) {
+        size_t decode_bytes = (expected - decode_offset > 256) ? 256 : (expected - decode_offset);
+        if (decode_bytes >= 4 && pcm_accumulated < DECODE_CHUNK_SIZE) {
+            size_t pcm_decoded = decode_adpcm_block(
+                audio_buf + decode_offset,
+                decode_bytes,
+                decode_buf + pcm_accumulated
             );
-            total_received += received;
+            pcm_accumulated += pcm_decoded;
+            decode_offset += decode_bytes;
             
-            // Try to decode available ADPCM data
-            while (decode_offset + 256 <= total_received && pcm_accumulated < DECODE_CHUNK_SIZE) {
-                size_t decode_bytes = (total_received - decode_offset > 256) ? 256 : (total_received - decode_offset);
-                if (decode_bytes >= 4) {  // Need minimum ADPCM block
-                    size_t pcm_decoded = decode_adpcm_block(
-                        adpcm_buf + decode_offset,
-                        decode_bytes,
-                        decode_buf + pcm_accumulated
-                    );
-                    pcm_accumulated += pcm_decoded;
-                    decode_offset += decode_bytes;
-                }
-                
-                // If we have 1 second of PCM, queue it immediately
-                if (pcm_accumulated >= CHUNK_SIZE) {
-                    size_t chunk_samples = CHUNK_SIZE;  // Exactly 1 second
-                    
-                    int16_t *chunk_data = heap_caps_malloc(chunk_samples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-                    if (chunk_data) {
-                        memcpy(chunk_data, decode_buf, chunk_samples * sizeof(int16_t));
-                        pcm_chunk_t chunk = {
-                            .data = chunk_data,
-                            .samples = chunk_samples
-                        };
-                        
-                        if (xQueueSend(pcm_queue, &chunk, pdMS_TO_TICKS(100)) == pdTRUE) {
-                            ESP_LOGI(TAG, "Streamed chunk %d: 1.00 seconds (while receiving)", chunk_num);
-                            chunk_num++;
-                        } else {
-                            ESP_LOGW(TAG, "PCM queue full, dropping streaming chunk");
-                            heap_caps_free(chunk_data);
-                            break;
-                        }
-                        
-                        // Shift remaining PCM data
-                        pcm_accumulated -= chunk_samples;
-                        if (pcm_accumulated > 0) {
-                            memmove(decode_buf, decode_buf + chunk_samples, pcm_accumulated * sizeof(int16_t));
-                        }
-                    } else {
-                        ESP_LOGE(TAG, "Failed to allocate streaming chunk memory");
-                        break;
-                    }
-                }
-            }
-            
-            // If decode buffer is full but we haven't hit 1-second boundary, flush it
-            if (pcm_accumulated >= DECODE_CHUNK_SIZE - SAMPLE_RATE) {
-                // Queue whatever we have
-                int16_t *chunk_data = heap_caps_malloc(pcm_accumulated * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+            // If we have 1 second of PCM, queue it
+            if (pcm_accumulated >= CHUNK_SIZE) {
+                int16_t *chunk_data = heap_caps_malloc(CHUNK_SIZE * sizeof(int16_t), MALLOC_CAP_SPIRAM);
                 if (chunk_data) {
-                    memcpy(chunk_data, decode_buf, pcm_accumulated * sizeof(int16_t));
-                    pcm_chunk_t chunk = {
-                        .data = chunk_data,
-                        .samples = pcm_accumulated
-                    };
+                    memcpy(chunk_data, decode_buf, CHUNK_SIZE * sizeof(int16_t));
+                    pcm_chunk_t chunk = { .data = chunk_data, .samples = CHUNK_SIZE };
                     
                     if (xQueueSend(pcm_queue, &chunk, pdMS_TO_TICKS(100)) == pdTRUE) {
-                        ESP_LOGI(TAG, "Flushed chunk %d: %.2f seconds", 
-                                chunk_num, pcm_accumulated / (float)SAMPLE_RATE);
+                        ESP_LOGI(TAG, "Queued ADPCM chunk %d: 1.00 seconds", chunk_num);
+                        // Debug first few ADPCM samples for comparison
+                        for (int i = 0; i < 5 && i < CHUNK_SIZE; i++) {
+                            ESP_LOGI(TAG, "ADPCM sample %d: %d", i+1, chunk_data[i]);
+                        }
                         chunk_num++;
-                        pcm_accumulated = 0;  // Reset for next batch
                     } else {
-                        ESP_LOGW(TAG, "PCM queue full, dropping flush chunk");
+                        ESP_LOGW(TAG, "PCM queue full, dropping ADPCM chunk");
                         heap_caps_free(chunk_data);
                         break;
                     }
+                    
+                    // Shift remaining PCM data
+                    pcm_accumulated -= CHUNK_SIZE;
+                    if (pcm_accumulated > 0) {
+                        memmove(decode_buf, decode_buf + CHUNK_SIZE, pcm_accumulated * sizeof(int16_t));
+                    }
                 }
             }
+        } else {
+            break;
         }
+    }
+    
+    // Queue remaining PCM data
+    if (pcm_accumulated > 0) {
+        int16_t *chunk_data = heap_caps_malloc(pcm_accumulated * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+        if (chunk_data) {
+            memcpy(chunk_data, decode_buf, pcm_accumulated * sizeof(int16_t));
+            pcm_chunk_t chunk = { .data = chunk_data, .samples = pcm_accumulated };
+            
+            if (xQueueSend(pcm_queue, &chunk, pdMS_TO_TICKS(100)) == pdTRUE) {
+                ESP_LOGI(TAG, "Final ADPCM chunk %d: %.2f seconds", 
+                        chunk_num, pcm_accumulated / (float)SAMPLE_RATE);
+            } else {
+                ESP_LOGW(TAG, "PCM queue full, dropping final ADPCM chunk");
+                heap_caps_free(chunk_data);
+            }
+        }
+    }
+    
+    heap_caps_free(decode_buf);
+    ESP_LOGI(TAG, "Completed ADPCM decode, total chunks: %d", chunk_num - 1);
+}
+
+/**
+ * @brief Process uncompressed PCM audio - stream and play chunks as data arrives
+ */
+static void process_uncompressed_audio(uint32_t expected)
+{
+    ESP_LOGI(TAG, "Streaming uncompressed PCM audio (%d bytes = %.1f seconds)", 
+             (int)expected, expected / (float)(SAMPLE_RATE * 2));
+    
+    const size_t CHUNK_BYTES = SAMPLE_RATE * 2;  // 1 second = 48KB at 24kHz 16-bit
+    const size_t BUFFER_SIZE = CHUNK_BYTES * 2;   // 2-second accumulation buffer
+    
+    // Allocate accumulation buffer for streaming
+    uint8_t *stream_buffer = heap_caps_malloc(BUFFER_SIZE, MALLOC_CAP_SPIRAM);
+    if (!stream_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate streaming buffer");
+        // Drain data to avoid blocking sender
+        uint8_t drain[1024];
+        size_t total_drained = 0;
+        while (total_drained < expected) {
+            size_t to_drain = (expected - total_drained > sizeof(drain)) ? sizeof(drain) : (expected - total_drained);
+            size_t drained = xStreamBufferReceive(sb_adpcm, drain, to_drain, portMAX_DELAY);
+            total_drained += drained;
+        }
+        return;
+    }
+    
+    size_t total_received = 0;
+    size_t buffer_used = 0;
+    int chunk_num = 1;
+    bool first_chunk_sent = false;
+    
+    while (total_received < expected) {
+        // Receive data into accumulation buffer
+        size_t buffer_space = BUFFER_SIZE - buffer_used;
+        size_t remaining_data = expected - total_received;
+        size_t to_read = (remaining_data > buffer_space) ? buffer_space : remaining_data;
         
-        // 5) Process any remaining PCM data after all ADPCM is received
-        if (pcm_accumulated > 0) {
-            int16_t *chunk_data = heap_caps_malloc(pcm_accumulated * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+        if (to_read > 2048) to_read = 2048;  // Receive in reasonable chunks
+        
+        size_t received = xStreamBufferReceive(
+            sb_adpcm,
+            stream_buffer + buffer_used,
+            to_read,
+            portMAX_DELAY
+        );
+        
+        total_received += received;
+        buffer_used += received;
+        
+        // Queue chunks as soon as we have enough data
+        while (buffer_used >= CHUNK_BYTES || (total_received >= expected && buffer_used > 0)) {
+            size_t chunk_bytes = (buffer_used >= CHUNK_BYTES) ? CHUNK_BYTES : buffer_used;
+            size_t chunk_samples = chunk_bytes / sizeof(int16_t);
+            
+            int16_t *chunk_data = heap_caps_malloc(chunk_samples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
             if (chunk_data) {
-                memcpy(chunk_data, decode_buf, pcm_accumulated * sizeof(int16_t));
-                pcm_chunk_t chunk = {
-                    .data = chunk_data,
-                    .samples = pcm_accumulated
-                };
+                memcpy(chunk_data, stream_buffer, chunk_bytes);
+                pcm_chunk_t chunk = { .data = chunk_data, .samples = chunk_samples };
                 
                 if (xQueueSend(pcm_queue, &chunk, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    ESP_LOGI(TAG, "Final chunk %d: %.2f seconds", 
-                            chunk_num, pcm_accumulated / (float)SAMPLE_RATE);
+                    ESP_LOGI(TAG, "Streamed chunk %d: %.2f seconds (%d/%d bytes received)", 
+                            chunk_num++, chunk_samples / (float)SAMPLE_RATE,
+                            (int)total_received, (int)expected);
+                    
+                    if (!first_chunk_sent) {
+                        ESP_LOGI(TAG, "🎵 Playback started while still receiving data");
+                        first_chunk_sent = true;
+                    }
                 } else {
-                    ESP_LOGW(TAG, "PCM queue full, dropping final chunk");
+                    ESP_LOGW(TAG, "PCM queue full, dropping chunk");
                     heap_caps_free(chunk_data);
+                    break;
                 }
+                
+                // Shift remaining data in buffer
+                buffer_used -= chunk_bytes;
+                if (buffer_used > 0) {
+                    memmove(stream_buffer, stream_buffer + chunk_bytes, buffer_used);
+                }
+            } else {
+                ESP_LOGE(TAG, "Failed to allocate chunk memory");
+                break;
             }
         }
         
-        // 6) Free the decode buffer
-        heap_caps_free(decode_buf);
-        ESP_LOGI(TAG, "Completed streaming decode, total chunks: %d", chunk_num - 1);
+        // If buffer is full but we can't make a chunk, we have a problem
+        if (buffer_used >= BUFFER_SIZE) {
+            ESP_LOGW(TAG, "Buffer overflow, resetting");
+            buffer_used = 0;
+        }
     }
+    
+    heap_caps_free(stream_buffer);
+    ESP_LOGI(TAG, "Completed streaming %d chunks (%.1f seconds total)", 
+             chunk_num - 1, expected / (float)(SAMPLE_RATE * 2));
 }
 
 /**
