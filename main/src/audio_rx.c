@@ -212,22 +212,6 @@ static void rx_task(void *arg)
         ESP_LOGI(TAG, "Header bytes: [0x%02X, 0x%02X, 0x%02X, 0x%02X]", 
                 header[0], header[1], header[2], header[3]);
 
-        // CRITICAL: Validate header to detect corruption from overlapping BLE transmissions
-        // Reasonable audio chunks are 1KB to 500KB (compressed or uncompressed)
-        if (expected < 1000 || expected > 500000) {
-            ESP_LOGW(TAG, "🚨 CORRUPTED HEADER DETECTED! Expected: %" PRIu32 " bytes - FLUSHING STREAM BUFFER", expected);
-            
-            // Flush the entire stream buffer to resync
-            size_t flushed = 0;
-            uint8_t flush_buf[1024];
-            while (xStreamBufferBytesAvailable(sb_adpcm) > 0) {
-                size_t chunk_size = xStreamBufferReceive(sb_adpcm, flush_buf, sizeof(flush_buf), pdMS_TO_TICKS(10));
-                if (chunk_size == 0) break;  // Timeout - buffer is empty
-                flushed += chunk_size;
-            }
-            ESP_LOGW(TAG, "🧹 Flushed %" PRIu32 " bytes from corrupted stream - waiting for next transmission", (uint32_t)flushed);
-            continue;  // Wait for next header
-        }
 
 
         // 2) Check config to determine processing method
@@ -421,7 +405,7 @@ static void process_uncompressed_audio(uint32_t expected)
                             (int)total_received, (int)expected);
                     
                     if (!first_chunk_sent) {
-                        ESP_LOGI(TAG, "🎵 Playback started while still receiving data");
+                        ESP_LOGI(TAG, "Playback started while still receiving data");
                         first_chunk_sent = true;
                     }
                 } else {
