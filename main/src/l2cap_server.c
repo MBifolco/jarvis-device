@@ -12,10 +12,7 @@
 #include "host/util/util.h"
 #include "os/os_mbuf.h"
 
-// Memory pool for L2CAP receive buffers
-static struct os_mbuf_pool g_l2cap_coc_mbuf_pool;
-static struct os_mempool g_l2cap_coc_mempool;
-static os_membuf_t g_l2cap_coc_membuf[OS_MEMPOOL_SIZE(4, 512)]; // 4 buffers of 512 bytes each
+// L2CAP uses system mbuf pool - no custom pool needed
 
 static const char *TAG = "L2CAP_SERVER";
 
@@ -156,21 +153,10 @@ static int l2cap_server_recv(struct ble_l2cap_chan *chan, struct os_mbuf *sdu_rx
     
     ESP_LOGI(TAG, "Sent echo response: '%s'", response);
     
-    // Free the received mbuf
+    // Free the received mbuf - the stack will handle buffer management
     os_mbuf_free_chain(sdu_rx);
     
-    // Prepare for next receive - allocate new buffer and mark ready
-    struct os_mbuf *next_sdu_rx = os_mbuf_get_pkthdr(&g_l2cap_coc_mbuf_pool, 0);
-    if (next_sdu_rx) {
-        rc = ble_l2cap_recv_ready(chan, next_sdu_rx);
-        if (rc != 0) {
-            ESP_LOGE(TAG, "Failed to prepare next receive buffer: %d", rc);
-            os_mbuf_free_chain(next_sdu_rx);
-        }
-    } else {
-        ESP_LOGE(TAG, "Failed to allocate next receive buffer");
-    }
-    
+    // Don't manually manage receive buffers - let the NimBLE stack handle it
     return 0;
 }
 
@@ -184,8 +170,8 @@ static int l2cap_server_accept(uint16_t conn_handle, uint16_t peer_sdu_size, str
     ESP_LOGI(TAG, "Accepting L2CAP connection: conn_handle=%d, peer_sdu_size=%d", 
              conn_handle, peer_sdu_size);
     
-    // Allocate receive buffer from our pool
-    sdu_rx = os_mbuf_get_pkthdr(&g_l2cap_coc_mbuf_pool, 0);
+    // Allocate receive buffer from system pool
+    sdu_rx = os_msys_get_pkthdr(0, 0);
     if (!sdu_rx) {
         ESP_LOGE(TAG, "Failed to allocate receive buffer");
         return BLE_HS_ENOMEM;
@@ -210,21 +196,6 @@ int l2cap_server_init(void) {
     int rc;
     
     ESP_LOGI(TAG, "Initializing L2CAP server on PSM 0x%02x", L2CAP_PSM);
-    
-    // Initialize memory pool for L2CAP receive buffers
-    rc = os_mempool_init(&g_l2cap_coc_mempool, 4, 512, 
-                         g_l2cap_coc_membuf, "l2cap_coc_pool");
-    if (rc != 0) {
-        ESP_LOGE(TAG, "Failed to initialize L2CAP memory pool: %d", rc);
-        return rc;
-    }
-    
-    rc = os_mbuf_pool_init(&g_l2cap_coc_mbuf_pool, &g_l2cap_coc_mempool, 
-                           512, 4);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "Failed to initialize L2CAP mbuf pool: %d", rc);
-        return rc;
-    }
     
     // Create L2CAP server
     rc = ble_l2cap_create_server(L2CAP_PSM, L2CAP_COC_MTU, l2cap_server_event, NULL);
