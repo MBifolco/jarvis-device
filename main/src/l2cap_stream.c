@@ -72,10 +72,13 @@ static int l2cap_event_cb(struct ble_l2cap_event *event, void *arg)
     
     switch (event->type) {
         case BLE_L2CAP_EVENT_COC_CONNECTED:
-            ESP_LOGI(TAG, "L2CAP channel connected");
+            ESP_LOGI(TAG, "L2CAP channel connected - conn_handle=%d", event->connect.conn_handle);
             if (ble_l2cap_get_chan_info(event->connect.chan, &chan_info) == 0) {
-                ESP_LOGI(TAG, "Channel info: our_mtu=%d, peer_mtu=%d, psm=%d",
-                        chan_info.our_l2cap_mtu, chan_info.peer_l2cap_mtu, chan_info.psm);
+                ESP_LOGI(TAG, "Final negotiated MTUs: our_l2cap_mtu=%d, peer_l2cap_mtu=%d, psm=%d, our_coc_mtu=%d, peer_coc_mtu=%d",
+                        chan_info.our_l2cap_mtu, chan_info.peer_l2cap_mtu, chan_info.psm, 
+                        chan_info.our_coc_mtu, chan_info.peer_coc_mtu);
+            } else {
+                ESP_LOGE(TAG, "Failed to get channel info after connection");
             }
             g_channel.chan = event->connect.chan;
             g_channel.conn_handle = event->connect.conn_handle;
@@ -88,7 +91,11 @@ static int l2cap_event_cb(struct ble_l2cap_event *event, void *arg)
                 if (rc != 0) {
                     ESP_LOGE(TAG, "Failed to prepare initial receive buffer: %d", rc);
                     os_mbuf_free_chain(initial_sdu_rx);
+                } else {
+                    ESP_LOGI(TAG, "Initial receive buffer prepared successfully");
                 }
+            } else {
+                ESP_LOGE(TAG, "Failed to allocate initial receive buffer");
             }
             break;
 
@@ -104,7 +111,8 @@ static int l2cap_event_cb(struct ble_l2cap_event *event, void *arg)
             break;
 
         case BLE_L2CAP_EVENT_COC_ACCEPT:
-            ESP_LOGI(TAG, "L2CAP accept request");
+            ESP_LOGI(TAG, "L2CAP accept request - conn_handle=%d, peer_sdu_size=%d", 
+                    event->accept.conn_handle, event->accept.peer_sdu_size);
             return l2cap_server_accept(event->accept.conn_handle, 
                                      event->accept.peer_sdu_size, 
                                      event->accept.chan);
@@ -126,10 +134,20 @@ static int l2cap_event_cb(struct ble_l2cap_event *event, void *arg)
  */
 static int l2cap_server_accept(uint16_t conn_handle, uint16_t peer_sdu_size, struct ble_l2cap_chan *chan) {
     struct os_mbuf *sdu_rx;
+    struct ble_l2cap_chan_info chan_info;
     int rc;
     
     ESP_LOGI(TAG, "Accepting L2CAP connection: conn_handle=%d, peer_sdu_size=%d", 
              conn_handle, peer_sdu_size);
+    
+    // Try to get channel info during accept to see negotiation
+    if (ble_l2cap_get_chan_info(chan, &chan_info) == 0) {
+        ESP_LOGI(TAG, "Channel info during accept: our_l2cap_mtu=%d, peer_l2cap_mtu=%d, our_coc_mtu=%d, peer_coc_mtu=%d",
+                chan_info.our_l2cap_mtu, chan_info.peer_l2cap_mtu, 
+                chan_info.our_coc_mtu, chan_info.peer_coc_mtu);
+    } else {
+        ESP_LOGW(TAG, "Channel info not available during accept");
+    }
     
     // Allocate receive buffer from our dedicated pool
     sdu_rx = os_mbuf_get_pkthdr(&g_l2cap_coc_mbuf_pool, 0);
@@ -276,13 +294,14 @@ esp_err_t l2cap_stream_init(void)
     }
     
     // Create L2CAP server
+    ESP_LOGI(TAG, "Creating L2CAP server: PSM=0x%04x, MTU=%d", JARVIS_PSM, L2CAP_MTU);
     rc = ble_l2cap_create_server(JARVIS_PSM, L2CAP_MTU, l2cap_event_cb, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "Failed to create L2CAP server; rc=%d", rc);
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "L2CAP CoC server registered on PSM 0x%04x", JARVIS_PSM);
+    ESP_LOGI(TAG, "L2CAP CoC server registered on PSM 0x%04x with MTU %d", JARVIS_PSM, L2CAP_MTU);
     return ESP_OK;
 }
 
