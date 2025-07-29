@@ -159,12 +159,13 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
             /* Print connection descriptor */
             print_conn_desc(&desc);
 
-            /* Try to update connection parameters */
-            struct ble_gap_upd_params params = {.itvl_min = desc.conn_itvl,
-                                                .itvl_max = desc.conn_itvl,
-                                                .latency = 3,
-                                                .supervision_timeout =
-                                                    desc.supervision_timeout};
+            /* Try to update connection parameters for optimal L2CAP throughput */
+            struct ble_gap_upd_params params = {
+                .itvl_min = 6,    // 7.5ms (6 * 1.25ms) - fast for throughput
+                .itvl_max = 8,    // 10ms (8 * 1.25ms) - still fast
+                .latency = 0,     // No latency for maximum throughput
+                .supervision_timeout = 400  // 4 seconds timeout
+            };
             rc = ble_gap_update_params(event->connect.conn_handle, &params);
             if (rc != 0) {
                 ESP_LOGE(

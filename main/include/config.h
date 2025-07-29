@@ -13,6 +13,7 @@ typedef enum {
     CFG_LED_BRIGHTNESS     = 0x03,
     CFG_PLAY_ON_DEVICE     = 0x04,
     CFG_L2CAP_STREAMING    = 0x05,
+    CFG_L2CAP_AUDIO        = 0x06,
     // add new IDs here…
 } config_id_t;
 
@@ -46,6 +47,7 @@ bool        config_get_send_debug_drops(void);
 bool        config_get_play_on_device(void);
 uint16_t    config_get_led_brightness(void);
 bool        config_get_l2cap_streaming(void);
+bool        config_get_l2cap_audio(void);
 
 // Send a notification of a single config change back to the phone.
 // (You can call these after updating in handle_write.)
@@ -54,4 +56,5 @@ void config_notify_send_debug_drops(void);
 void config_notify_led_brightness(void);
 void config_notify_play_on_device(void);
 void config_notify_l2cap_streaming(void);
+void config_notify_l2cap_audio(void);
 

@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <inttypes.h>
 #include "config.h"
+#include "audio_rx.h"
 
 #define TAG "L2CAP"
 #define JARVIS_PSM 0x0040
@@ -20,10 +21,10 @@
 static uint32_t g_packets_received = 0;
 static uint32_t g_bytes_received = 0;
 
-// Memory pool for L2CAP receive buffers
+// Memory pool for L2CAP receive buffers - increased for better throughput
 static struct os_mbuf_pool g_l2cap_coc_mbuf_pool;
 static struct os_mempool g_l2cap_coc_mempool;
-static os_membuf_t g_l2cap_coc_membuf[OS_MEMPOOL_SIZE(4, 512)]; // 4 buffers of 512 bytes each
+static os_membuf_t g_l2cap_coc_membuf[OS_MEMPOOL_SIZE(8, 512)]; // 8 buffers of 512 bytes each
 
 // Channel structure to track connections
 typedef struct {
@@ -55,8 +56,8 @@ static void recv_ready_task(void *pvParameters)
     
     while (1) {
         if (xQueueReceive(recv_ready_queue, &msg, portMAX_DELAY)) {
-            // Small delay to ensure L2CAP state is settled
-            vTaskDelay(pdMS_TO_TICKS(5));
+            // Minimal delay to ensure L2CAP state is settled - reduced for throughput
+            vTaskDelay(pdMS_TO_TICKS(1));
             
             struct os_mbuf *next_sdu_rx = os_mbuf_get_pkthdr(&g_l2cap_coc_mbuf_pool, 0);
             if (next_sdu_rx) {
@@ -217,6 +218,16 @@ static int l2cap_server_recv(struct ble_l2cap_chan *chan, struct os_mbuf *sdu_rx
                 os_mbuf_free_chain(sdu_tx);
             }
         }
+    } else if (config_get_l2cap_audio()) {
+        // Audio mode - forward data to audio playback system
+        ESP_LOGI(TAG, "Audio mode: received %d bytes (total: %lu packets, %lu bytes)", 
+                 len, (unsigned long)g_packets_received, (unsigned long)g_bytes_received);
+        
+        // Forward to audio playback system
+        esp_err_t err = audio_rx_on_write(buf, len);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Audio playback failed: %s", esp_err_to_name(err));
+        }
     } else if (config_get_l2cap_streaming()) {
         // Streaming mode - just receive, no echo
         ESP_LOGI(TAG, "Streaming mode: received %d bytes (total: %lu packets, %lu bytes)", 
@@ -298,7 +309,7 @@ esp_err_t l2cap_stream_init(void)
     ESP_LOGI(TAG, "Initializing L2CAP server on PSM 0x%04x", JARVIS_PSM);
     
     // Initialize memory pool for L2CAP receive buffers
-    rc = os_mempool_init(&g_l2cap_coc_mempool, 4, 512, 
+    rc = os_mempool_init(&g_l2cap_coc_mempool, 8, 512, 
                          g_l2cap_coc_membuf, "l2cap_coc_pool");
     if (rc != 0) {
         ESP_LOGE(TAG, "Failed to initialize L2CAP memory pool: %d", rc);
@@ -306,7 +317,7 @@ esp_err_t l2cap_stream_init(void)
     }
     
     rc = os_mbuf_pool_init(&g_l2cap_coc_mbuf_pool, &g_l2cap_coc_mempool, 
-                           512, 4);
+                           512, 8);
     if (rc != 0) {
         ESP_LOGE(TAG, "Failed to initialize L2CAP mbuf pool: %d", rc);
         return ESP_FAIL;

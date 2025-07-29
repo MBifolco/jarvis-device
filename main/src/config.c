@@ -12,7 +12,8 @@ static bool   s_compress_incoming  = false;
 static bool   s_send_debug_drops   = false;
 static uint16_t s_led_brightness   = 0;
 static bool   s_play_on_device     = true;
-static bool   s_l2cap_streaming    = false; 
+static bool   s_l2cap_streaming    = false;
+static bool   s_l2cap_audio        = true;  // Default to audio mode for voice assistant 
 
 //––– Helpers to notify the central –––
 static void _notify(const uint8_t *buf, size_t len) {
@@ -79,12 +80,22 @@ void config_notify_l2cap_streaming(void) {
     _notify(buf, sizeof(buf));
 }
 
+void config_notify_l2cap_audio(void) {
+    uint8_t buf[3] = {
+        CFG_L2CAP_AUDIO,
+        1,
+        s_l2cap_audio ? 1 : 0
+    };
+    _notify(buf, sizeof(buf));
+}
+
 //––– Public getters –––
 bool     config_get_compress_incoming(void) { return s_compress_incoming; }
 bool     config_get_send_debug_drops(void)  { return s_send_debug_drops; }
 bool     config_get_play_on_device(void)    { return s_play_on_device; }
 uint16_t config_get_led_brightness(void)    { return s_led_brightness; }
 bool     config_get_l2cap_streaming(void)   { return s_l2cap_streaming; }
+bool     config_get_l2cap_audio(void)       { return s_l2cap_audio; }
 
 //––– Initialization –––
 void config_init(void) {
@@ -99,6 +110,8 @@ void config_init(void) {
              s_play_on_device ? "ON" : "OFF");
     ESP_LOGI(TAG, "CFG_L2CAP_STREAMING    = %s",
              s_l2cap_streaming ? "ON" : "OFF");
+    ESP_LOGI(TAG, "CFG_L2CAP_AUDIO        = %s",
+             s_l2cap_audio ? "ON" : "OFF");
     // defaults already set above; if you want to push them to the phone:
     
     if (chr_conn_handle != 0) {
@@ -107,6 +120,7 @@ void config_init(void) {
         config_notify_led_brightness();
         config_notify_play_on_device();
         config_notify_l2cap_streaming();
+        config_notify_l2cap_audio();
     }
 }
 
@@ -172,6 +186,15 @@ void config_handle_write(const uint8_t *data, size_t len) {
                     l2cap_stream_reset_stats();
                 }
                 config_notify_l2cap_streaming();
+            }
+            break;
+
+        case CFG_L2CAP_AUDIO:
+            if (paylen == 1) {
+                s_l2cap_audio = (val[0] != 0);
+                ESP_LOGI(TAG, "CFG_L2CAP_AUDIO = %s",
+                         s_l2cap_audio ? "ON" : "OFF");
+                config_notify_l2cap_audio();
             }
             break;
 
