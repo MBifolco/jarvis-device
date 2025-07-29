@@ -15,7 +15,7 @@
 
 #define TAG "L2CAP"
 #define JARVIS_PSM 0x0040
-#define L2CAP_MTU  512
+#define L2CAP_MTU  768
 
 // Packet statistics
 static uint32_t g_packets_received = 0;
@@ -24,7 +24,7 @@ static uint32_t g_bytes_received = 0;
 // Memory pool for L2CAP receive buffers - increased for better throughput
 static struct os_mbuf_pool g_l2cap_coc_mbuf_pool;
 static struct os_mempool g_l2cap_coc_mempool;
-static os_membuf_t g_l2cap_coc_membuf[OS_MEMPOOL_SIZE(8, 512)]; // 8 buffers of 512 bytes each
+static os_membuf_t g_l2cap_coc_membuf[OS_MEMPOOL_SIZE(16, 800)]; // 16 buffers of 800 bytes each
 
 // Channel structure to track connections
 typedef struct {
@@ -56,6 +56,7 @@ static void recv_ready_task(void *pvParameters)
     
     while (1) {
         if (xQueueReceive(recv_ready_queue, &msg, portMAX_DELAY)) {
+            ESP_LOGI(TAG, "Processing deferred recv_ready request...");
             // Minimal delay to ensure L2CAP state is settled - reduced for throughput
             vTaskDelay(pdMS_TO_TICKS(1));
             
@@ -63,7 +64,7 @@ static void recv_ready_task(void *pvParameters)
             if (next_sdu_rx) {
                 int rc = ble_l2cap_recv_ready(msg.chan, next_sdu_rx);
                 if (rc == 0) {
-                    ESP_LOGI(TAG, "Deferred recv_ready succeeded");
+                    ESP_LOGI(TAG, "Deferred recv_ready succeeded - waiting for next packet");
                 } else {
                     ESP_LOGE(TAG, "Deferred recv_ready failed: %d", rc);
                     os_mbuf_free_chain(next_sdu_rx);
@@ -115,7 +116,7 @@ static int l2cap_event_cb(struct ble_l2cap_event *event, void *arg)
             break;
 
         case BLE_L2CAP_EVENT_COC_DATA_RECEIVED:
-            ESP_LOGI(TAG, "L2CAP data received");
+            ESP_LOGI(TAG, "L2CAP data received - packet arrived!");
             l2cap_server_recv(event->receive.chan, event->receive.sdu_rx);
             break;
 
@@ -183,7 +184,7 @@ static int l2cap_server_accept(uint16_t conn_handle, uint16_t peer_sdu_size, str
 static int l2cap_server_recv(struct ble_l2cap_chan *chan, struct os_mbuf *sdu_rx) {
     struct os_mbuf *sdu_tx;
     int len, rc;
-    uint8_t buf[L2CAP_MTU];
+    uint8_t buf[L2CAP_MTU];  // Now 1024 bytes
     
     len = OS_MBUF_PKTLEN(sdu_rx);
     ESP_LOGI(TAG, "Received %d bytes via L2CAP", len);
@@ -275,11 +276,13 @@ static int l2cap_server_recv(struct ble_l2cap_chan *chan, struct os_mbuf *sdu_rx
     os_mbuf_free_chain(sdu_rx);
     
     // Try immediate buffer preparation first
+    ESP_LOGI(TAG, "Attempting to prepare next receive buffer...");
     struct os_mbuf *next_sdu_rx = os_mbuf_get_pkthdr(&g_l2cap_coc_mbuf_pool, 0);
     if (next_sdu_rx) {
+        ESP_LOGI(TAG, "Got mbuf, calling ble_l2cap_recv_ready...");
         rc = ble_l2cap_recv_ready(chan, next_sdu_rx);
         if (rc == 0) {
-            ESP_LOGI(TAG, "Successfully prepared next receive buffer immediately");
+            ESP_LOGI(TAG, "Successfully prepared next receive buffer immediately - waiting for next packet");
             return 0;
         } else if (rc == BLE_HS_EBUSY) {
             // Defer the call using task
@@ -297,7 +300,7 @@ static int l2cap_server_recv(struct ble_l2cap_chan *chan, struct os_mbuf *sdu_rx
             return rc;
         }
     } else {
-        ESP_LOGE(TAG, "Failed to allocate next receive buffer");
+        ESP_LOGE(TAG, "Failed to allocate next receive buffer - pool exhausted?");
         return BLE_HS_ENOMEM;
     }
 }
@@ -309,7 +312,7 @@ esp_err_t l2cap_stream_init(void)
     ESP_LOGI(TAG, "Initializing L2CAP server on PSM 0x%04x", JARVIS_PSM);
     
     // Initialize memory pool for L2CAP receive buffers
-    rc = os_mempool_init(&g_l2cap_coc_mempool, 8, 512, 
+    rc = os_mempool_init(&g_l2cap_coc_mempool, 16, 800, 
                          g_l2cap_coc_membuf, "l2cap_coc_pool");
     if (rc != 0) {
         ESP_LOGE(TAG, "Failed to initialize L2CAP memory pool: %d", rc);
@@ -317,7 +320,7 @@ esp_err_t l2cap_stream_init(void)
     }
     
     rc = os_mbuf_pool_init(&g_l2cap_coc_mbuf_pool, &g_l2cap_coc_mempool, 
-                           512, 8);
+                           800, 16);
     if (rc != 0) {
         ESP_LOGE(TAG, "Failed to initialize L2CAP mbuf pool: %d", rc);
         return ESP_FAIL;

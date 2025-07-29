@@ -161,8 +161,8 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
 
             /* Try to update connection parameters for optimal L2CAP throughput */
             struct ble_gap_upd_params params = {
-                .itvl_min = 6,    // 7.5ms (6 * 1.25ms) - fast for throughput
-                .itvl_max = 8,    // 10ms (8 * 1.25ms) - still fast
+                .itvl_min = 6,    // 7.5ms (6 * 1.25ms) - fast for throughput  
+                .itvl_max = 6,    // 7.5ms (6 * 1.25ms) - fixed interval for consistency
                 .latency = 0,     // No latency for maximum throughput
                 .supervision_timeout = 400  // 4 seconds timeout
             };
@@ -174,6 +174,15 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
                     rc);
                 return rc;
             }
+            
+            // Force data length extension negotiation for higher L2CAP MTU
+            int rc_dle = ble_gap_set_data_len(event->connect.conn_handle, 251, 2120);
+            if (rc_dle != 0) {
+                ESP_LOGW(TAG, "Failed to set data length: %d", rc_dle);
+            } else {
+                ESP_LOGI(TAG, "Data length extension requested (251 octets, 2120 μs)");
+            }
+            
             gatt_svc_gap_event_cb(event);
         }
         /* Connection failed, restart advertising */
@@ -208,6 +217,15 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
         }
         print_conn_desc(&desc);
         return rc;
+
+    /* Data length change event - monitor DLE negotiation */
+    case BLE_GAP_EVENT_DATA_LEN_CHG:
+        ESP_LOGI(TAG, "Data length changed: max_tx_octets=%d, max_rx_octets=%d, max_tx_time=%d, max_rx_time=%d",
+                 event->data_len_chg.max_tx_octets,
+                 event->data_len_chg.max_rx_octets,
+                 event->data_len_chg.max_tx_time,
+                 event->data_len_chg.max_rx_time);
+        return 0;
 
     /* Advertising complete event */
     case BLE_GAP_EVENT_ADV_COMPLETE:
