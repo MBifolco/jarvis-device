@@ -7,10 +7,18 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include <string.h>
+#include <stdio.h>
+#include <inttypes.h>
+#include "config.h"
 
 #define TAG "L2CAP"
 #define JARVIS_PSM 0x0040
 #define L2CAP_MTU  512
+
+// Packet statistics
+static uint32_t g_packets_received = 0;
+static uint32_t g_bytes_received = 0;
 
 // Memory pool for L2CAP receive buffers
 static struct os_mbuf_pool g_l2cap_coc_mbuf_pool;
@@ -169,7 +177,7 @@ static int l2cap_server_accept(uint16_t conn_handle, uint16_t peer_sdu_size, str
 }
 
 /**
- * Handle received L2CAP data and echo it back with prefix
+ * Handle received L2CAP data - echo or streaming mode based on config
  */
 static int l2cap_server_recv(struct ble_l2cap_chan *chan, struct os_mbuf *sdu_rx) {
     struct os_mbuf *sdu_tx;
@@ -179,8 +187,12 @@ static int l2cap_server_recv(struct ble_l2cap_chan *chan, struct os_mbuf *sdu_rx
     len = OS_MBUF_PKTLEN(sdu_rx);
     ESP_LOGI(TAG, "Received %d bytes via L2CAP", len);
     
-    if (len > sizeof(buf) - 7) {  // Reserve space for "ECHO: " prefix
-        len = sizeof(buf) - 7;
+    // Update packet statistics
+    g_packets_received++;
+    g_bytes_received += len;
+    
+    if (len > sizeof(buf)) {
+        len = sizeof(buf);
     }
     
     // Extract data from mbuf
@@ -191,41 +203,61 @@ static int l2cap_server_recv(struct ble_l2cap_chan *chan, struct os_mbuf *sdu_rx
         return rc;
     }
     
-    // Create response mbuf
-    sdu_tx = os_msys_get_pkthdr(0, 0);
-    if (!sdu_tx) {
-        ESP_LOGE(TAG, "Failed to allocate TX mbuf");
-        os_mbuf_free_chain(sdu_rx);
-        return BLE_HS_ENOMEM;
-    }
-    
-    // Create echo response with prefix - handle binary data properly
-    int max_data_len = L2CAP_MTU - 6;  // Reserve 6 bytes for "ECHO: "
-    if (len > max_data_len) {
-        len = max_data_len;
-    }
-    
-    uint8_t response[L2CAP_MTU];
-    memcpy(response, "ECHO: ", 6);
-    memcpy(response + 6, buf, len);
-    int response_len = 6 + len;
-    
-    // Add data to mbuf
-    rc = os_mbuf_append(sdu_tx, response, response_len);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "Failed to append data to mbuf");
-        os_mbuf_free_chain(sdu_tx);
-        os_mbuf_free_chain(sdu_rx);
-        return rc;
-    }
-    
-    // Send response
-    rc = ble_l2cap_send(chan, sdu_tx);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "Failed to send L2CAP data: %d", rc);
-        os_mbuf_free_chain(sdu_tx);
+    // Check for status query command
+    if (len >= 7 && memcmp(buf, "STATUS?", 7) == 0) {
+        // Report packet statistics
+        sdu_tx = os_msys_get_pkthdr(0, 0);
+        if (sdu_tx) {
+            char status[64];
+            snprintf(status, sizeof(status), "STATUS:%lu,%lu", (unsigned long)g_packets_received, (unsigned long)g_bytes_received);
+            if (os_mbuf_append(sdu_tx, status, strlen(status)) == 0) {
+                ble_l2cap_send(chan, sdu_tx);
+                ESP_LOGI(TAG, "Sent status: %s", status);
+            } else {
+                os_mbuf_free_chain(sdu_tx);
+            }
+        }
+    } else if (config_get_l2cap_streaming()) {
+        // Streaming mode - just receive, no echo
+        ESP_LOGI(TAG, "Streaming mode: received %d bytes (total: %lu packets, %lu bytes)", 
+                 len, (unsigned long)g_packets_received, (unsigned long)g_bytes_received);
     } else {
-        ESP_LOGI(TAG, "Echoed %d bytes back via L2CAP", response_len);
+        // Echo mode - send data back with prefix
+        sdu_tx = os_msys_get_pkthdr(0, 0);
+        if (!sdu_tx) {
+            ESP_LOGE(TAG, "Failed to allocate TX mbuf");
+            os_mbuf_free_chain(sdu_rx);
+            return BLE_HS_ENOMEM;
+        }
+        
+        // Create echo response with prefix - handle binary data properly
+        int max_data_len = L2CAP_MTU - 6;  // Reserve 6 bytes for "ECHO: "
+        if (len > max_data_len) {
+            len = max_data_len;
+        }
+        
+        uint8_t response[L2CAP_MTU];
+        memcpy(response, "ECHO: ", 6);
+        memcpy(response + 6, buf, len);
+        int response_len = 6 + len;
+        
+        // Add data to mbuf
+        rc = os_mbuf_append(sdu_tx, response, response_len);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "Failed to append data to mbuf");
+            os_mbuf_free_chain(sdu_tx);
+            os_mbuf_free_chain(sdu_rx);
+            return rc;
+        }
+        
+        // Send response
+        rc = ble_l2cap_send(chan, sdu_tx);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "Failed to send L2CAP data: %d", rc);
+            os_mbuf_free_chain(sdu_tx);
+        } else {
+            ESP_LOGI(TAG, "Echoed %d bytes back via L2CAP", response_len);
+        }
     }
     
     // Free the received mbuf
@@ -338,4 +370,11 @@ esp_err_t l2cap_stream_send(const uint8_t *data, size_t len)
 uint16_t l2cap_stream_get_psm(void)
 {
     return JARVIS_PSM;
+}
+
+void l2cap_stream_reset_stats(void)
+{
+    g_packets_received = 0;
+    g_bytes_received = 0;
+    ESP_LOGI(TAG, "Reset L2CAP packet statistics");
 }
