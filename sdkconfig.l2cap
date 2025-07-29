@@ -1,0 +1,9 @@
+# L2CAP Configuration for jarvis-device
+# This file contains the configuration changes needed to enable L2CAP COC
+
+# Enable L2CAP Connection-Oriented Channels
+CONFIG_BT_NIMBLE_L2CAP_COC_MAX_NUM=2
+CONFIG_BT_NIMBLE_L2CAP_COC_SDU_BUFF_COUNT=4
+
+# These are aliases that might be needed
+CONFIG_NIMBLE_L2CAP_COC_MAX_NUM=2
