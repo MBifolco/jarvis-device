@@ -3,6 +3,7 @@
 #include "common.h"
 #include "gap.h"
 #include "gatt_svc.h"
+#include "l2cap_stream.h"
 
 
 /* Library function declarations */
@@ -93,6 +94,12 @@ void bluetooth_init(void) {
     rc = gatt_svc_init();
     if (rc != 0) {
         ESP_LOGE(TAG, "failed to initialize GATT server, error code: %d", rc);
+        return;
+    }
+
+    /* L2CAP stream initialization */
+    if (l2cap_stream_init() != ESP_OK) {
+        ESP_LOGE(TAG, "failed to initialize L2CAP stream");
         return;
     }
 

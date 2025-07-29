@@ -9,6 +9,7 @@
 #include "os/os_mbuf.h"
 #include "audio_rx.h"
 #include "config.h"
+#include "l2cap_stream.h"
 /* Private function declarations */
 static int chr_access(uint16_t conn_handle, uint16_t attr_handle,
                                  struct ble_gatt_access_ctxt *ctxt, void *arg);
@@ -23,6 +24,7 @@ uint16_t wake_chr_handle;
 uint16_t audio_notify_handle;
 uint16_t audio_write_handle;
 uint16_t config_ctrl_handle;
+uint16_t l2cap_psm_handle;
 static bool handle_inited = false;
 static bool ind_status = false;
 
@@ -86,6 +88,18 @@ static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
                 .val_handle = &config_ctrl_handle,
             },
             {
+                // L2CAP PSM characteristic (read-only)
+                .uuid = BLE_UUID128_DECLARE(
+                    0x12, 0x34, 0x56, 0x78,
+                    0x9A, 0xBC, 0xDE, 0xF0,
+                    0x11, 0x22, 0x33, 0x44,
+                    0x55, 0x66, 0x77, 0x88
+                ),
+                .access_cb  = chr_access,
+                .flags      = BLE_GATT_CHR_F_READ,
+                .val_handle = &l2cap_psm_handle,
+            },
+            {
                 0  // End of characteristic list
             }
         }
@@ -108,6 +122,12 @@ static int chr_access(uint16_t conn_handle, uint16_t attr_handle,
 
     /* Read characteristic event */
     case BLE_GATT_ACCESS_OP_READ_CHR:
+        /* Handle L2CAP PSM read */
+        if (attr_handle == l2cap_psm_handle) {
+            uint16_t psm = l2cap_stream_get_psm();
+            rc = os_mbuf_append(ctxt->om, &psm, sizeof(psm));
+            return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+        }
         return 0;
     case BLE_GATT_ACCESS_OP_WRITE_CHR:
         /* Verify attribute handle */
@@ -193,6 +213,13 @@ void gatt_svr_register_cb(struct ble_gatt_register_ctxt *ctxt, void *arg) {
             0x0b, 0xc1, 0x7a, 0xf4
         );
 
+        static const ble_uuid128_t l2cap_psm_uuid = BLE_UUID128_INIT(
+            0x12, 0x34, 0x56, 0x78,
+            0x9A, 0xBC, 0xDE, 0xF0,
+            0x11, 0x22, 0x33, 0x44,
+            0x55, 0x66, 0x77, 0x88
+        );
+
         if (ble_uuid_cmp(ctxt->chr.chr_def->uuid, &wake_uuid.u) == 0) {
             wake_chr_handle = ctxt->chr.val_handle;
             ESP_LOGI(TAG, "Saved wake_chr_handle = %d", wake_chr_handle);
@@ -208,6 +235,10 @@ void gatt_svr_register_cb(struct ble_gatt_register_ctxt *ctxt, void *arg) {
         if (ble_uuid_cmp(ctxt->chr.chr_def->uuid, &config_ctrl_uuid.u) == 0) {
             config_ctrl_handle = ctxt->chr.val_handle;
             ESP_LOGI(TAG, "Saved config_ctrl_handle = %d", config_ctrl_handle);
+        }
+        if (ble_uuid_cmp(ctxt->chr.chr_def->uuid, &l2cap_psm_uuid.u) == 0) {
+            l2cap_psm_handle = ctxt->chr.val_handle;
+            ESP_LOGI(TAG, "Saved l2cap_psm_handle = %d", l2cap_psm_handle);
         }
         break;
 

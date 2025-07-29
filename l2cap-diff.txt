@@ -1,0 +1,820 @@
+diff --git a/enable_l2cap.sh b/enable_l2cap.sh
+new file mode 100755
+index 0000000..9b2d18d
+--- /dev/null
++++ b/enable_l2cap.sh
+@@ -0,0 +1,20 @@
++#!/bin/bash
++
++# Enable L2CAP COC in ESP32 configuration
++
++echo "Enabling L2CAP Connection-Oriented Channels..."
++
++# Update sdkconfig
++sed -i 's/CONFIG_BT_NIMBLE_L2CAP_COC_MAX_NUM=0/CONFIG_BT_NIMBLE_L2CAP_COC_MAX_NUM=2/g' sdkconfig
++sed -i 's/CONFIG_NIMBLE_L2CAP_COC_MAX_NUM=0/CONFIG_NIMBLE_L2CAP_COC_MAX_NUM=2/g' sdkconfig
++
++# If lines don't exist, append them
++if ! grep -q "CONFIG_BT_NIMBLE_L2CAP_COC_MAX_NUM" sdkconfig; then
++    echo "CONFIG_BT_NIMBLE_L2CAP_COC_MAX_NUM=2" >> sdkconfig
++fi
++
++if ! grep -q "CONFIG_NIMBLE_L2CAP_COC_MAX_NUM" sdkconfig; then
++    echo "CONFIG_NIMBLE_L2CAP_COC_MAX_NUM=2" >> sdkconfig
++fi
++
++echo "L2CAP configuration updated. Run 'idf.py reconfigure' to apply changes."
+\ No newline at end of file
+diff --git a/main/bluetooth.c b/main/bluetooth.c
+index 426fab0..3a9007d 100644
+--- a/main/bluetooth.c
++++ b/main/bluetooth.c
+@@ -3,7 +3,8 @@
+ #include "common.h"
+ #include "gap.h"
+ #include "gatt_svc.h"
+-
++#include "l2cap_server.h"
++#include "l2cap_stream.h"
+ 
+ /* Library function declarations */
+ void ble_store_config_init(void);
+@@ -96,6 +97,12 @@ void bluetooth_init(void) {
+         return;
+     }
+ 
++    rc = l2cap_stream_init();
++    if (rc != 0) {
++        ESP_LOGE(TAG, "failed to initialize L2CAP stream, error code: %d", rc);
++        return;
++    }
++
+     /* NimBLE host configuration initialization */
+     nimble_host_config_init();
+ 
+diff --git a/main/include/l2cap_server.h b/main/include/l2cap_server.h
+new file mode 100644
+index 0000000..3443b88
+--- /dev/null
++++ b/main/include/l2cap_server.h
+@@ -0,0 +1,36 @@
++/**
++ * L2CAP Connection-Oriented Channel (COC) Server
++ */
++
++#ifndef L2CAP_SERVER_H
++#define L2CAP_SERVER_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++/**
++ * Initialize L2CAP server
++ * @return 0 on success, error code on failure
++ */
++int l2cap_server_init(void);
++
++/**
++ * Send text message over L2CAP channel
++ * @param text Text to send
++ * @return 0 on success, error code on failure
++ */
++int l2cap_server_send_text(const char *text);
++
++/**
++ * Get L2CAP PSM (Protocol Service Multiplexer)
++ * @return PSM value
++ */
++uint16_t l2cap_server_get_psm(void);
++
++/**
++ * Check if L2CAP channel is connected
++ * @return true if connected, false otherwise
++ */
++bool l2cap_server_is_connected(void);
++
++#endif /* L2CAP_SERVER_H */
+\ No newline at end of file
+diff --git a/main/include/l2cap_stream.h b/main/include/l2cap_stream.h
+new file mode 100644
+index 0000000..1210694
+--- /dev/null
++++ b/main/include/l2cap_stream.h
+@@ -0,0 +1,15 @@
++#ifndef L2CAP_STREAM_H
++#define L2CAP_STREAM_H
++
++//#pragma once
++#include <stdint.h>
++#include <stddef.h>
++#include "esp_err.h"
++
++// Initialize L2CAP CoC server
++esp_err_t l2cap_stream_init(void);
++
++// Send data over the CoC connection
++esp_err_t l2cap_stream_send(const uint8_t *data, size_t len);
++
++#endif // L2CAP_STREAM_H
+\ No newline at end of file
+diff --git a/main/main.c b/main/main.c
+index c54cc28..170fca7 100644
+--- a/main/main.c
++++ b/main/main.c
+@@ -34,6 +34,8 @@
+ #include "task_info.h"
+ #include "wakeword_handler.h"
+ #include "i2s_setup.h"  // for i2s_mic_init(), i2s_play_init()
++#include "l2cap_stream.h"
++
+ 
+ static const char *TAG          = "wakeword";
+ static const char *TAG_WAV      = "wav_player";
+@@ -118,8 +120,69 @@ static void fetch_task(void *arg)
+     while (1) {
+         while ((res = info->iface->fetch(info->data)) != NULL) {
+             // 1) Wake word → arm record
+-            if (res->wakeup_state == WAKENET_DETECTED && info->using_wake) {
+-                wakeword_handler_handle(info, feed_handle, keepAliveTimer);
++           //# if (res->wakeup_state == WAKENET_DETECTED && info->using_wake) {
++           //     wakeword_handler_handle(info, feed_handle, keepAliveTimer);
++            if (res->wakeup_state == WAKENET_DETECTED) {
++                ESP_LOGI(TAG, "Wake word detected (idx=%d)",
++                         res->wakenet_model_index);
++                    
++                vTaskSuspend(feed_handle);
++                tone_play(1000, 100, 50);
++
++                gatt_svc_notify_wake();
++                ESP_LOGI(TAG, "Wake word notification sent");
++                tone_play(1500, 80, 60);
++
++                // allocate stereo buffer then a mono buffer
++                int total_samples = POST_WAKE_SECONDS * 16000;
++                size_t stereo_bytes = total_samples * channels * sizeof(int16_t);
++                int16_t *stereo = malloc(stereo_bytes);
++                int16_t *mono   = malloc(total_samples * sizeof(int16_t));
++                if (!stereo || !mono) {
++                    ESP_LOGE(TAG, "OOM on post-wake buffers");
++                    free(stereo); free(mono);
++                    continue;
++                }
++
++                // read exactly POST_WAKE_SECONDS worth of FRAMEs
++                size_t captured = 0;
++                while (captured < (size_t)total_samples) {
++                    size_t br2;
++                    size_t to_read = chunksize * channels * sizeof(int16_t);
++                    if (i2s_read(I2S_MIC_PORT,
++                                 stereo + captured * channels,
++                                 to_read, &br2, portMAX_DELAY) != ESP_OK) {
++                        break;
++                    }
++                    captured += br2 / (channels * sizeof(int16_t));
++                }
++                ESP_LOGI(TAG, "Captured %u frames, de-interleaving…", captured);
++
++                // pull out LEFT channel (mic) only
++                for (size_t i = 0; i < captured; i++) {
++                    mono[i] = stereo[i * channels];                                                                                                                                                                                                                                                                                                                                                             
++                }
++                free(stereo);
++                
++                // send to phone
++                ESP_LOGI(TAG, "Sending %u bytes to phone…", captured * sizeof(int16_t));
++                //audio_tx_send((const uint8_t *)mono, captured * sizeof(int16_t));
++                l2cap_stream_send((const uint8_t *)mono, captured * sizeof(int16_t));
++                ESP_LOGI(TAG, "Sent %u bytes to phone", captured * sizeof(int16_t));
++                
++                // playback mono buffer
++                //size_t written;
++                //esp_err_t err = i2s_write(I2S_SPK_PORT, mono,
++                //                          captured * sizeof(int16_t),
++                //                          &written, portMAX_DELAY);
++                //ESP_LOGI(TAG,
++                //         "Playback done (frames=%u, bytes=%u, err=%d)",
++                //         (unsigned)captured, (unsigned)written, err);
++
++                free(mono);
++
++                // ── Now resume feeding so AFE can keep up ──
++               vTaskResume(feed_handle);
+             }
+ 
+             // 2) VAD logic during hold (now in audio_pipeline module)
+diff --git a/main/src/gap.c b/main/src/gap.c
+index 80d603c..0309147 100644
+--- a/main/src/gap.c
++++ b/main/src/gap.c
+@@ -7,6 +7,7 @@
+ #include "gap.h"
+ #include "common.h"
+ #include "gatt_svc.h"
++#include "l2cap_stream.h"
+ 
+ /* Private function declarations */
+ inline static void format_addr(char *addr_str, uint8_t addr[]);
+diff --git a/main/src/gatt_svc.c b/main/src/gatt_svc.c
+index 51f6e08..93b27a9 100644
+--- a/main/src/gatt_svc.c
++++ b/main/src/gatt_svc.c
+@@ -9,6 +9,7 @@
+ #include "os/os_mbuf.h"
+ #include "audio_rx.h"
+ #include "config.h"
++#include "l2cap_server.h"
+ /* Private function declarations */
+ static int chr_access(uint16_t conn_handle, uint16_t attr_handle,
+                                  struct ble_gatt_access_ctxt *ctxt, void *arg);
+@@ -23,6 +24,7 @@ uint16_t wake_chr_handle;
+ uint16_t audio_notify_handle;
+ uint16_t audio_write_handle;
+ uint16_t config_ctrl_handle;
++uint16_t l2cap_psm_handle;
+ static bool handle_inited = false;
+ static bool ind_status = false;
+ 
+@@ -85,6 +87,18 @@ static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
+                 .flags      = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_NOTIFY,
+                 .val_handle = &config_ctrl_handle,
+             },
++            {
++                // L2CAP PSM characteristic (read-only)
++                .uuid = BLE_UUID128_DECLARE(
++                    0x12, 0x34, 0x56, 0x78,
++                    0x9A, 0xBC, 0xDE, 0xF0,
++                    0x11, 0x22, 0x33, 0x44,
++                    0x55, 0x66, 0x77, 0x88
++                ),
++                .access_cb  = chr_access,
++                .flags      = BLE_GATT_CHR_F_READ,
++                .val_handle = &l2cap_psm_handle,
++            },
+             {
+                 0  // End of characteristic list
+             }
+@@ -108,6 +122,12 @@ static int chr_access(uint16_t conn_handle, uint16_t attr_handle,
+ 
+     /* Read characteristic event */
+     case BLE_GATT_ACCESS_OP_READ_CHR:
++        /* Handle L2CAP PSM read */
++        if (attr_handle == l2cap_psm_handle) {
++            uint16_t psm = l2cap_server_get_psm();
++            rc = os_mbuf_append(ctxt->om, &psm, sizeof(psm));
++            return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
++        }
+         return 0;
+     case BLE_GATT_ACCESS_OP_WRITE_CHR:
+         /* Verify attribute handle */
+@@ -193,6 +213,13 @@ void gatt_svr_register_cb(struct ble_gatt_register_ctxt *ctxt, void *arg) {
+             0x0b, 0xc1, 0x7a, 0xf4
+         );
+ 
++        static const ble_uuid128_t l2cap_psm_uuid = BLE_UUID128_INIT(
++            0x12, 0x34, 0x56, 0x78,
++            0x9A, 0xBC, 0xDE, 0xF0,
++            0x11, 0x22, 0x33, 0x44,
++            0x55, 0x66, 0x77, 0x88
++        );
++
+         if (ble_uuid_cmp(ctxt->chr.chr_def->uuid, &wake_uuid.u) == 0) {
+             wake_chr_handle = ctxt->chr.val_handle;
+             ESP_LOGI(TAG, "Saved wake_chr_handle = %d", wake_chr_handle);
+@@ -209,6 +236,10 @@ void gatt_svr_register_cb(struct ble_gatt_register_ctxt *ctxt, void *arg) {
+             config_ctrl_handle = ctxt->chr.val_handle;
+             ESP_LOGI(TAG, "Saved config_ctrl_handle = %d", config_ctrl_handle);
+         }
++        if (ble_uuid_cmp(ctxt->chr.chr_def->uuid, &l2cap_psm_uuid.u) == 0) {
++            l2cap_psm_handle = ctxt->chr.val_handle;
++            ESP_LOGI(TAG, "Saved l2cap_psm_handle = %d", l2cap_psm_handle);
++        }
+         break;
+ 
+     /* Descriptor register event */
+diff --git a/main/src/l2cap_server.c b/main/src/l2cap_server.c
+new file mode 100644
+index 0000000..aecc0e8
+--- /dev/null
++++ b/main/src/l2cap_server.c
+@@ -0,0 +1,264 @@
++/**
++ * L2CAP Connection-Oriented Channel (COC) Server
++ * Simple text echo server for testing L2CAP implementation
++ */
++
++#include <string.h>
++#include "esp_log.h"
++#include "nimble/nimble_port.h"
++#include "nimble/nimble_port_freertos.h"
++#include "host/ble_hs.h"
++#include "host/ble_l2cap.h"
++#include "host/util/util.h"
++#include "os/os_mbuf.h"
++
++// L2CAP uses system mbuf pool - no custom pool needed
++
++static const char *TAG = "L2CAP_SERVER";
++
++// PSM (Protocol Service Multiplexer) for our L2CAP service
++// Using dynamic PSM range 0x80-0xFF
++#define L2CAP_PSM 0x80
++
++// L2CAP COC MTU
++#define L2CAP_COC_MTU 512
++
++// Forward declarations
++static int l2cap_server_recv(struct ble_l2cap_chan *chan, struct os_mbuf *sdu_rx);
++static int l2cap_server_event(struct ble_l2cap_event *event, void *arg);
++static int l2cap_server_accept(uint16_t conn_handle, uint16_t peer_sdu_size, struct ble_l2cap_chan *chan);
++
++// Channel structure to track connections
++typedef struct {
++    struct ble_l2cap_chan *chan;
++    uint16_t conn_handle;
++    bool connected;
++} l2cap_channel_t;
++
++static l2cap_channel_t g_channel = {0};
++
++/**
++ * L2CAP event handler
++ */
++static int l2cap_server_event(struct ble_l2cap_event *event, void *arg) {
++    struct ble_l2cap_chan_info chan_info;
++    
++    switch (event->type) {
++        case BLE_L2CAP_EVENT_COC_CONNECTED:
++            ESP_LOGI(TAG, "L2CAP channel connected");
++            if (ble_l2cap_get_chan_info(event->connect.chan, &chan_info) == 0) {
++                ESP_LOGI(TAG, "Channel info: our_mtu=%d, peer_mtu=%d, psm=%d",
++                        chan_info.our_l2cap_mtu, chan_info.peer_l2cap_mtu, chan_info.psm);
++            }
++            g_channel.chan = event->connect.chan;
++            g_channel.conn_handle = event->connect.conn_handle;
++            g_channel.connected = true;
++            break;
++            
++        case BLE_L2CAP_EVENT_COC_DISCONNECTED:
++            ESP_LOGI(TAG, "L2CAP channel disconnected");
++            g_channel.connected = false;
++            g_channel.chan = NULL;
++            break;
++            
++        case BLE_L2CAP_EVENT_COC_DATA_RECEIVED:
++            ESP_LOGI(TAG, "L2CAP data received");
++            l2cap_server_recv(event->receive.chan, event->receive.sdu_rx);
++            break;
++            
++        case BLE_L2CAP_EVENT_COC_ACCEPT:
++            ESP_LOGI(TAG, "L2CAP accept request");
++            return l2cap_server_accept(event->accept.conn_handle, 
++                                     event->accept.peer_sdu_size, 
++                                     event->accept.chan);
++            
++        case BLE_L2CAP_EVENT_COC_TX_UNSTALLED:
++            ESP_LOGI(TAG, "L2CAP TX unstalled - can send more data");
++            break;
++            
++        default:
++            ESP_LOGW(TAG, "Unknown L2CAP event type: %d", event->type);
++            break;
++    }
++    
++    return 0;
++}
++
++/**
++ * Handle received data - echo it back
++ */
++static int l2cap_server_recv(struct ble_l2cap_chan *chan, struct os_mbuf *sdu_rx) {
++    int rc;
++    uint16_t len;
++    uint8_t buf[L2CAP_COC_MTU];
++    struct os_mbuf *sdu_tx;
++    
++    if (!chan || !sdu_rx) {
++        return BLE_HS_EINVAL;
++    }
++    
++    // Get data length
++    len = OS_MBUF_PKTLEN(sdu_rx);
++    ESP_LOGI(TAG, "Received %d bytes", len);
++    
++    if (len > sizeof(buf)) {
++        len = sizeof(buf);
++    }
++    
++    // Copy data from mbuf to buffer
++    rc = os_mbuf_copydata(sdu_rx, 0, len, buf);
++    if (rc != 0) {
++        ESP_LOGE(TAG, "Failed to copy mbuf data");
++        return rc;
++    }
++    
++    // Log received text (assume it's text for testing)
++    if (len < sizeof(buf)) {
++        buf[len] = '\0';  // Null terminate for printing
++        ESP_LOGI(TAG, "Received text: '%s'", (char*)buf);
++    } else {
++        ESP_LOGI(TAG, "Received %d bytes (truncated)", len);
++    }
++    
++    // Create response mbuf
++    sdu_tx = os_msys_get_pkthdr(0, 0);
++    if (!sdu_tx) {
++        ESP_LOGE(TAG, "Failed to allocate TX mbuf");
++        return BLE_HS_ENOMEM;
++    }
++    
++    // Create echo response with prefix
++    char response[L2CAP_COC_MTU];
++    int response_len = snprintf(response, sizeof(response), "ECHO: %.*s", 
++                               (int)(sizeof(response) - 7), (char*)buf);
++    if (response_len >= sizeof(response)) {
++        response_len = sizeof(response) - 1;
++    }
++    
++    // Add data to mbuf
++    rc = os_mbuf_append(sdu_tx, response, response_len);
++    if (rc != 0) {
++        ESP_LOGE(TAG, "Failed to append data to mbuf");
++        os_mbuf_free_chain(sdu_tx);
++        return rc;
++    }
++    
++    // Send response
++    rc = ble_l2cap_send(chan, sdu_tx);
++    if (rc != 0) {
++        ESP_LOGE(TAG, "Failed to send L2CAP data: %d", rc);
++        os_mbuf_free_chain(sdu_tx);
++        return rc;
++    }
++    
++    ESP_LOGI(TAG, "Sent echo response: '%s'", response);
++    
++    // Free the received mbuf - the stack will handle buffer management
++    os_mbuf_free_chain(sdu_rx);
++    
++    // Don't manually manage receive buffers - let the NimBLE stack handle it
++    return 0;
++}
++
++/**
++ * Handle L2CAP accept request and prepare receive buffer
++ */
++static int l2cap_server_accept(uint16_t conn_handle, uint16_t peer_sdu_size, struct ble_l2cap_chan *chan) {
++    struct os_mbuf *sdu_rx;
++    int rc;
++    
++    ESP_LOGI(TAG, "Accepting L2CAP connection: conn_handle=%d, peer_sdu_size=%d", 
++             conn_handle, peer_sdu_size);
++    
++    // Allocate receive buffer from system pool
++    sdu_rx = os_msys_get_pkthdr(0, 0);
++    if (!sdu_rx) {
++        ESP_LOGE(TAG, "Failed to allocate receive buffer");
++        return BLE_HS_ENOMEM;
++    }
++    
++    // Mark channel as ready to receive with the allocated buffer
++    rc = ble_l2cap_recv_ready(chan, sdu_rx);
++    if (rc != 0) {
++        ESP_LOGE(TAG, "Failed to mark channel ready: %d", rc);
++        os_mbuf_free_chain(sdu_rx);
++        return rc;
++    }
++    
++    ESP_LOGI(TAG, "L2CAP channel ready to receive data");
++    return 0;
++}
++
++/**
++ * Initialize L2CAP server
++ */
++int l2cap_server_init(void) {
++    int rc;
++    
++    ESP_LOGI(TAG, "Initializing L2CAP server on PSM 0x%02x", L2CAP_PSM);
++    
++    // Create L2CAP server
++    rc = ble_l2cap_create_server(L2CAP_PSM, L2CAP_COC_MTU, l2cap_server_event, NULL);
++    if (rc != 0) {
++        ESP_LOGE(TAG, "Failed to create L2CAP server: %d", rc);
++        return rc;
++    }
++    
++    ESP_LOGI(TAG, "L2CAP server created successfully");
++    
++    return 0;
++}
++
++/**
++ * Send text message over L2CAP
++ */
++int l2cap_server_send_text(const char *text) {
++    struct os_mbuf *sdu_tx;
++    int rc;
++    
++    if (!g_channel.connected || !g_channel.chan) {
++        ESP_LOGW(TAG, "L2CAP channel not connected");
++        return -1;
++    }
++    
++    // Create mbuf for transmission
++    sdu_tx = os_msys_get_pkthdr(0, 0);
++    if (!sdu_tx) {
++        ESP_LOGE(TAG, "Failed to allocate TX mbuf");
++        return BLE_HS_ENOMEM;
++    }
++    
++    // Add text to mbuf
++    rc = os_mbuf_append(sdu_tx, text, strlen(text));
++    if (rc != 0) {
++        ESP_LOGE(TAG, "Failed to append data to mbuf");
++        os_mbuf_free_chain(sdu_tx);
++        return rc;
++    }
++    
++    // Send data
++    rc = ble_l2cap_send(g_channel.chan, sdu_tx);
++    if (rc != 0) {
++        ESP_LOGE(TAG, "Failed to send L2CAP data: %d", rc);
++        os_mbuf_free_chain(sdu_tx);
++        return rc;
++    }
++    
++    ESP_LOGI(TAG, "Sent text: '%s'", text);
++    
++    return 0;
++}
++
++/**
++ * Get L2CAP PSM for advertising via GATT
++ */
++uint16_t l2cap_server_get_psm(void) {
++    return L2CAP_PSM;
++}
++
++/**
++ * Check if L2CAP channel is connected
++ */
++bool l2cap_server_is_connected(void) {
++    return g_channel.connected;
++}
+\ No newline at end of file
+diff --git a/main/src/l2cap_stream.c b/main/src/l2cap_stream.c
+new file mode 100644
+index 0000000..246d096
+--- /dev/null
++++ b/main/src/l2cap_stream.c
+@@ -0,0 +1,78 @@
++#include "l2cap_stream.h"
++#include "esp_log.h"
++#include "host/ble_l2cap.h"
++#include "os/os_mbuf.h"
++
++#define TAG "L2CAP"
++#define JARVIS_PSM 0x0040
++#define L2CAP_MTU  512
++
++static struct ble_l2cap_chan *audio_chan = NULL;
++
++static int l2cap_event_cb(struct ble_l2cap_event *event, void *arg)
++{
++    switch (event->type) {
++        case BLE_L2CAP_EVENT_COC_CONNECTED:
++            ESP_LOGI(TAG, "L2CAP channel connected");
++            audio_chan = event->connect.chan;
++            break;
++
++        case BLE_L2CAP_EVENT_COC_DISCONNECTED:
++            ESP_LOGI(TAG, "L2CAP channel disconnected");
++            audio_chan = NULL;
++            break;
++
++        case BLE_L2CAP_EVENT_COC_DATA_RECEIVED:
++            ESP_LOGI(TAG, "Received %d bytes via L2CAP (discarded)",
++                     OS_MBUF_PKTLEN(event->receive.sdu_rx));
++            os_mbuf_free_chain(event->receive.sdu_rx);
++            break;
++
++        default:
++            ESP_LOGW(TAG, "Unhandled L2CAP event: %d", event->type);
++            break;
++    }
++
++    return 0;
++}
++
++esp_err_t l2cap_stream_init(void)
++{
++    int rc = ble_l2cap_create_server(JARVIS_PSM, L2CAP_MTU, l2cap_event_cb, NULL);
++    if (rc != 0) {
++        ESP_LOGE(TAG, "Failed to create L2CAP server; rc=%d", rc);
++        return ESP_FAIL;
++    }
++
++    ESP_LOGI(TAG, "L2CAP CoC server registered on PSM 0x%04x", JARVIS_PSM);
++    return ESP_OK;
++}
++
++esp_err_t l2cap_stream_send(const uint8_t *data, size_t len)
++{
++    if (!audio_chan) {
++        ESP_LOGW(TAG, "No active L2CAP channel");
++        return ESP_FAIL;
++    }
++
++    struct os_mbuf *om = os_mbuf_get_pkthdr(NULL, 0);
++    if (!om) {
++        ESP_LOGE(TAG, "Failed to allocate L2CAP mbuf");
++        return ESP_FAIL;
++    }
++
++    if (os_mbuf_append(om, data, len) != 0) {
++        ESP_LOGE(TAG, "Failed to append data to mbuf");
++        os_mbuf_free_chain(om);
++        return ESP_FAIL;
++    }
++
++    int rc = ble_l2cap_send(audio_chan, om);
++    if (rc != 0) {
++        ESP_LOGE(TAG, "ble_l2cap_send failed; rc=%d", rc);
++        return ESP_FAIL;
++    }
++
++    ESP_LOGI(TAG, "Sent %d bytes via L2CAP", (int)len);
++    return ESP_OK;
++}
+diff --git a/sdkconfig b/sdkconfig
+index 66d0e61..12bd7f3 100644
+--- a/sdkconfig
++++ b/sdkconfig
+@@ -575,6 +575,15 @@ CONFIG_SR_NSN_WEBRTC=y
+ CONFIG_SR_VADN_WEBRTC=y
+ # CONFIG_SR_VADN_VADNET1_MEDIUM is not set
+ 
++#
++# Load Multiple Wake Words (WakeNet9s)
++#
++# CONFIG_SR_WN_WN9S_HILEXIN is not set
++# CONFIG_SR_WN_WN9S_HIESP is not set
++# CONFIG_SR_WN_WN9S_NIHAOXIAOZHI is not set
++# CONFIG_SR_WN_WN9S_HIJASON is not set
++# end of Load Multiple Wake Words (WakeNet9s)
++
+ #
+ # Load Multiple Wake Words (WakeNet9)
+ #
+@@ -601,6 +610,7 @@ CONFIG_SR_WN_WN9_JARVIS_TTS=y
+ # CONFIG_SR_WN_WN9_XIAOBINXIAOBIN_TTS is not set
+ # CONFIG_SR_WN_WN9_HAIXIAOWU_TTS is not set
+ # CONFIG_SR_WN_WN9_ASTROLABE_TTS is not set
++# CONFIG_SR_WN_WN9_HEYILY_TTS2 is not set
+ # CONFIG_SR_WN_WN9_XIAOYAXIAOYA_TTS2 is not set
+ # CONFIG_SR_WN_WN9_HIJASON_TTS2 is not set
+ # CONFIG_SR_WN_WN9_LINAIBAN_TTS2 is not set
+@@ -611,6 +621,7 @@ CONFIG_SR_WN_WN9_JARVIS_TTS=y
+ # CONFIG_SR_WN_WN9_XIAOJIANXIAOJIAN_TTS2 is not set
+ # CONFIG_SR_WN_WN9_XIAOTEXIAOTE_TTS2 is not set
+ # CONFIG_SR_WN_WN9_NIHAOXIAOYI_TTS2 is not set
++# CONFIG_SR_WN_WN9_NIHAOBAIYING_TTS2 is not set
+ # CONFIG_SR_WN_WN9_HIWALLE_TTS2 is not set
+ # end of Load Multiple Wake Words (WakeNet9)
+ 
+@@ -703,7 +714,8 @@ CONFIG_BT_NIMBLE_LOG_LEVEL=1
+ CONFIG_BT_NIMBLE_MAX_CONNECTIONS=3
+ CONFIG_BT_NIMBLE_MAX_BONDS=3
+ CONFIG_BT_NIMBLE_MAX_CCCDS=8
+-CONFIG_BT_NIMBLE_L2CAP_COC_MAX_NUM=0
++CONFIG_BT_NIMBLE_L2CAP_COC_MAX_NUM=2
++# CONFIG_BT_NIMBLE_L2CAP_ENHANCED_COC is not set
+ CONFIG_BT_NIMBLE_PINNED_TO_CORE_0=y
+ # CONFIG_BT_NIMBLE_PINNED_TO_CORE_1 is not set
+ CONFIG_BT_NIMBLE_PINNED_TO_CORE=0
+@@ -740,7 +752,7 @@ CONFIG_BT_NIMBLE_TRANSPORT_ACL_SIZE=512
+ CONFIG_BT_NIMBLE_TRANSPORT_EVT_SIZE=70
+ CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=30
+ CONFIG_BT_NIMBLE_TRANSPORT_EVT_DISCARD_COUNT=8
+-CONFIG_BT_NIMBLE_L2CAP_COC_SDU_BUFF_COUNT=1
++CONFIG_BT_NIMBLE_L2CAP_COC_SDU_BUFF_COUNT=4
+ # end of Memory Settings
+ 
+ CONFIG_BT_NIMBLE_GATT_MAX_PROCS=4
+@@ -930,11 +942,6 @@ CONFIG_BT_CTRL_LE_PING_EN=y
+ 
+ # CONFIG_BT_CTRL_RUN_IN_FLASH_ONLY is not set
+ # CONFIG_BT_CTRL_CHECK_CONNECT_IND_ACCESS_ADDRESS is not set
+-
+-#
+-# Controller debug log Options (Experimental)
+-#
+-# end of Controller debug log Options (Experimental)
+ # end of Controller Options
+ 
+ #
+@@ -1007,12 +1014,6 @@ CONFIG_TWAI_ERRATA_FIX_LISTEN_ONLY_DOM=y
+ # CONFIG_I2S_SKIP_LEGACY_CONFLICT_CHECK is not set
+ # end of Legacy I2S Driver Configurations
+ 
+-#
+-# Legacy I2C Driver Configurations
+-#
+-# CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK is not set
+-# end of Legacy I2C Driver Configurations
+-
+ #
+ # Legacy PCNT Driver Configurations
+ #
+@@ -1092,7 +1093,6 @@ CONFIG_ESP_ERR_TO_NAME_LOOKUP=y
+ CONFIG_GPTIMER_ISR_HANDLER_IN_IRAM=y
+ # CONFIG_GPTIMER_CTRL_FUNC_IN_IRAM is not set
+ # CONFIG_GPTIMER_ISR_IRAM_SAFE is not set
+-CONFIG_GPTIMER_OBJ_CACHE_SAFE=y
+ # CONFIG_GPTIMER_ENABLE_DEBUG_LOG is not set
+ # end of ESP-Driver:GPTimer Configurations
+ 
+@@ -1325,17 +1325,15 @@ CONFIG_RTC_CLK_CAL_CYCLES=1024
+ #
+ # Peripheral Control
+ #
+-# CONFIG_PERIPH_CTRL_FUNC_IN_IRAM is not set
++CONFIG_PERIPH_CTRL_FUNC_IN_IRAM=y
+ # end of Peripheral Control
+ 
+ #
+ # GDMA Configurations
+ #
+ CONFIG_GDMA_CTRL_FUNC_IN_IRAM=y
+-CONFIG_GDMA_ISR_HANDLER_IN_IRAM=y
+-CONFIG_GDMA_OBJ_DRAM_SAFE=y
+-# CONFIG_GDMA_ENABLE_DEBUG_LOG is not set
+ # CONFIG_GDMA_ISR_IRAM_SAFE is not set
++# CONFIG_GDMA_ENABLE_DEBUG_LOG is not set
+ # end of GDMA Configurations
+ 
+ #
+@@ -1713,14 +1711,6 @@ CONFIG_FATFS_VFS_FSTAT_BLKSIZE=0
+ # CONFIG_FATFS_IMMEDIATE_FSYNC is not set
+ # CONFIG_FATFS_USE_LABEL is not set
+ CONFIG_FATFS_LINK_LOCK=y
+-# CONFIG_FATFS_USE_DYN_BUFFERS is not set
+-
+-#
+-# File system free space calculation behavior
+-#
+-CONFIG_FATFS_DONT_TRUST_FREE_CLUSTER_CNT=0
+-CONFIG_FATFS_DONT_TRUST_LAST_ALLOC=0
+-# end of File system free space calculation behavior
+ # end of FAT Filesystem support
+ 
+ #
+@@ -2102,7 +2092,6 @@ CONFIG_MBEDTLS_HAVE_TIME=y
+ # CONFIG_MBEDTLS_PLATFORM_TIME_ALT is not set
+ # CONFIG_MBEDTLS_HAVE_TIME_DATE is not set
+ CONFIG_MBEDTLS_ECDSA_DETERMINISTIC=y
+-CONFIG_MBEDTLS_SHA1_C=y
+ CONFIG_MBEDTLS_SHA512_C=y
+ # CONFIG_MBEDTLS_SHA3_C is not set
+ CONFIG_MBEDTLS_TLS_SERVER_AND_CLIENT=y
+@@ -2184,7 +2173,6 @@ CONFIG_MBEDTLS_ECP_NIST_OPTIM=y
+ # CONFIG_MBEDTLS_THREADING_C is not set
+ CONFIG_MBEDTLS_ERROR_STRINGS=y
+ CONFIG_MBEDTLS_FS_IO=y
+-# CONFIG_MBEDTLS_ALLOW_WEAK_CERTIFICATE_VERIFICATION is not set
+ # end of mbedTLS
+ 
+ #
+@@ -2299,7 +2287,6 @@ CONFIG_SPI_FLASH_HPM_DC_AUTO=y
+ # CONFIG_SPI_FLASH_AUTO_SUSPEND is not set
+ CONFIG_SPI_FLASH_SUSPEND_TSUS_VAL_US=50
+ # CONFIG_SPI_FLASH_FORCE_ENABLE_XMC_C_SUSPEND is not set
+-# CONFIG_SPI_FLASH_FORCE_ENABLE_C6_H2_SUSPEND is not set
+ # end of Optional and Experimental Features (READ DOCS FIRST)
+ # end of Main Flash configuration
+ 
+@@ -2595,7 +2582,7 @@ CONFIG_NIMBLE_MEM_ALLOC_MODE_INTERNAL=y
+ CONFIG_NIMBLE_MAX_CONNECTIONS=3
+ CONFIG_NIMBLE_MAX_BONDS=3
+ CONFIG_NIMBLE_MAX_CCCDS=8
+-CONFIG_NIMBLE_L2CAP_COC_MAX_NUM=0
++CONFIG_NIMBLE_L2CAP_COC_MAX_NUM=2
+ CONFIG_NIMBLE_PINNED_TO_CORE_0=y
+ # CONFIG_NIMBLE_PINNED_TO_CORE_1 is not set
+ CONFIG_NIMBLE_PINNED_TO_CORE=0
+diff --git a/sdkconfig.l2cap b/sdkconfig.l2cap
+new file mode 100644
+index 0000000..3190c4a
+--- /dev/null
++++ b/sdkconfig.l2cap
+@@ -0,0 +1,9 @@
++# L2CAP Configuration for jarvis-device
++# This file contains the configuration changes needed to enable L2CAP COC
++
++# Enable L2CAP Connection-Oriented Channels
++CONFIG_BT_NIMBLE_L2CAP_COC_MAX_NUM=2
++CONFIG_BT_NIMBLE_L2CAP_COC_SDU_BUFF_COUNT=4
++
++# These are aliases that might be needed
++CONFIG_NIMBLE_L2CAP_COC_MAX_NUM=2
+\ No newline at end of file
