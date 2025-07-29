@@ -4,10 +4,18 @@
 #include "host/ble_hs.h"
 #include "os/os_mbuf.h"
 #include "nimble/nimble_port.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
 
 #define TAG "L2CAP"
 #define JARVIS_PSM 0x0040
 #define L2CAP_MTU  512
+
+// Memory pool for L2CAP receive buffers
+static struct os_mbuf_pool g_l2cap_coc_mbuf_pool;
+static struct os_mempool g_l2cap_coc_mempool;
+static os_membuf_t g_l2cap_coc_membuf[OS_MEMPOOL_SIZE(4, 512)]; // 4 buffers of 512 bytes each
 
 // Channel structure to track connections
 typedef struct {
@@ -18,9 +26,45 @@ typedef struct {
 
 static l2cap_channel_t g_channel = {0};
 
+// Task-based deferral for recv_ready calls
+static QueueHandle_t recv_ready_queue = NULL;
+
+typedef struct {
+    struct ble_l2cap_chan *chan;
+} recv_ready_msg_t;
+
 // Forward declarations
 static int l2cap_server_recv(struct ble_l2cap_chan *chan, struct os_mbuf *sdu_rx);
 static int l2cap_server_accept(uint16_t conn_handle, uint16_t peer_sdu_size, struct ble_l2cap_chan *chan);
+static void recv_ready_task(void *pvParameters);
+
+/**
+ * Task to handle deferred recv_ready calls when BLE_HS_EBUSY occurs
+ */
+static void recv_ready_task(void *pvParameters)
+{
+    recv_ready_msg_t msg;
+    
+    while (1) {
+        if (xQueueReceive(recv_ready_queue, &msg, portMAX_DELAY)) {
+            // Small delay to ensure L2CAP state is settled
+            vTaskDelay(pdMS_TO_TICKS(5));
+            
+            struct os_mbuf *next_sdu_rx = os_mbuf_get_pkthdr(&g_l2cap_coc_mbuf_pool, 0);
+            if (next_sdu_rx) {
+                int rc = ble_l2cap_recv_ready(msg.chan, next_sdu_rx);
+                if (rc == 0) {
+                    ESP_LOGI(TAG, "Deferred recv_ready succeeded");
+                } else {
+                    ESP_LOGE(TAG, "Deferred recv_ready failed: %d", rc);
+                    os_mbuf_free_chain(next_sdu_rx);
+                }
+            } else {
+                ESP_LOGE(TAG, "Failed to allocate mbuf for deferred recv_ready");
+            }
+        }
+    }
+}
 
 static int l2cap_event_cb(struct ble_l2cap_event *event, void *arg)
 {
@@ -36,6 +80,16 @@ static int l2cap_event_cb(struct ble_l2cap_event *event, void *arg)
             g_channel.chan = event->connect.chan;
             g_channel.conn_handle = event->connect.conn_handle;
             g_channel.connected = true;
+            
+            // Initial buffer setup for receiving
+            struct os_mbuf *initial_sdu_rx = os_mbuf_get_pkthdr(&g_l2cap_coc_mbuf_pool, 0);
+            if (initial_sdu_rx) {
+                int rc = ble_l2cap_recv_ready(event->connect.chan, initial_sdu_rx);
+                if (rc != 0) {
+                    ESP_LOGE(TAG, "Failed to prepare initial receive buffer: %d", rc);
+                    os_mbuf_free_chain(initial_sdu_rx);
+                }
+            }
             break;
 
         case BLE_L2CAP_EVENT_COC_DISCONNECTED:
@@ -77,8 +131,8 @@ static int l2cap_server_accept(uint16_t conn_handle, uint16_t peer_sdu_size, str
     ESP_LOGI(TAG, "Accepting L2CAP connection: conn_handle=%d, peer_sdu_size=%d", 
              conn_handle, peer_sdu_size);
     
-    // Allocate receive buffer from system pool
-    sdu_rx = os_msys_get_pkthdr(0, 0);
+    // Allocate receive buffer from our dedicated pool
+    sdu_rx = os_mbuf_get_pkthdr(&g_l2cap_coc_mbuf_pool, 0);
     if (!sdu_rx) {
         ESP_LOGE(TAG, "Failed to allocate receive buffer");
         return BLE_HS_ENOMEM;
@@ -156,27 +210,73 @@ static int l2cap_server_recv(struct ble_l2cap_chan *chan, struct os_mbuf *sdu_rx
         ESP_LOGI(TAG, "Echoed %d bytes back via L2CAP", response_len);
     }
     
-    // Free the received mbuf - the stack will handle buffer management
+    // Free the received mbuf
     os_mbuf_free_chain(sdu_rx);
     
-    // Prepare next receive buffer - this is critical for continuous operation
-    struct os_mbuf *next_sdu_rx = os_msys_get_pkthdr(0, 0);
+    // Try immediate buffer preparation first
+    struct os_mbuf *next_sdu_rx = os_mbuf_get_pkthdr(&g_l2cap_coc_mbuf_pool, 0);
     if (next_sdu_rx) {
-        int ready_rc = ble_l2cap_recv_ready(chan, next_sdu_rx);
-        if (ready_rc != 0) {
-            ESP_LOGE(TAG, "Failed to prepare next receive buffer: %d", ready_rc);
+        rc = ble_l2cap_recv_ready(chan, next_sdu_rx);
+        if (rc == 0) {
+            ESP_LOGI(TAG, "Successfully prepared next receive buffer immediately");
+            return 0;
+        } else if (rc == BLE_HS_EBUSY) {
+            // Defer the call using task
+            ESP_LOGW(TAG, "recv_ready returned EBUSY, deferring to task");
             os_mbuf_free_chain(next_sdu_rx);
+            
+            recv_ready_msg_t msg = { .chan = chan };
+            if (xQueueSend(recv_ready_queue, &msg, 0) != pdTRUE) {
+                ESP_LOGE(TAG, "Failed to queue recv_ready message");
+            }
+            return 0;
+        } else {
+            ESP_LOGE(TAG, "recv_ready failed with error: %d", rc);
+            os_mbuf_free_chain(next_sdu_rx);
+            return rc;
         }
     } else {
         ESP_LOGE(TAG, "Failed to allocate next receive buffer");
+        return BLE_HS_ENOMEM;
     }
-    
-    return 0;
 }
 
 esp_err_t l2cap_stream_init(void)
 {
-    int rc = ble_l2cap_create_server(JARVIS_PSM, L2CAP_MTU, l2cap_event_cb, NULL);
+    int rc;
+    
+    ESP_LOGI(TAG, "Initializing L2CAP server on PSM 0x%04x", JARVIS_PSM);
+    
+    // Initialize memory pool for L2CAP receive buffers
+    rc = os_mempool_init(&g_l2cap_coc_mempool, 4, 512, 
+                         g_l2cap_coc_membuf, "l2cap_coc_pool");
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Failed to initialize L2CAP memory pool: %d", rc);
+        return ESP_FAIL;
+    }
+    
+    rc = os_mbuf_pool_init(&g_l2cap_coc_mbuf_pool, &g_l2cap_coc_mempool, 
+                           512, 4);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Failed to initialize L2CAP mbuf pool: %d", rc);
+        return ESP_FAIL;
+    }
+    
+    // Create queue and task for deferred recv_ready calls
+    recv_ready_queue = xQueueCreate(8, sizeof(recv_ready_msg_t));
+    if (!recv_ready_queue) {
+        ESP_LOGE(TAG, "Failed to create recv_ready_queue");
+        return ESP_FAIL;
+    }
+    
+    if (xTaskCreate(recv_ready_task, "l2cap_recv_ready", 2048, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create recv_ready task");
+        vQueueDelete(recv_ready_queue);
+        return ESP_FAIL;
+    }
+    
+    // Create L2CAP server
+    rc = ble_l2cap_create_server(JARVIS_PSM, L2CAP_MTU, l2cap_event_cb, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "Failed to create L2CAP server; rc=%d", rc);
         return ESP_FAIL;
