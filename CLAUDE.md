@@ -13,7 +13,7 @@ This is an ESP32-based voice assistant device called "jarvis-device" that implem
 ### System Integration
 This firmware works in conjunction with a Flutter mobile app located at `../jarvis-app/`. The ESP32 device:
 - Acts as a BLE peripheral that the Flutter app connects to
-- Streams compressed audio data to the mobile app via BLE characteristics
+- Streams compressed or uncompressed audio data to the mobile app via BLE characteristics
 - Receives configuration commands from the mobile app
 - Provides real-time status updates (recording state, battery, etc.)
 
@@ -57,16 +57,18 @@ Key flow:
 2. Feed audio through current AFE instance (wake/hold)
 3. Wake word detection triggers switch to hold instance
 4. VAD controls recording start/stop during hold phase
-5. Audio data compressed and transmitted via BLE
+5. Audio data compressed (if config calls for it) and transmitted via BLE
 
 ### Hardware Configuration
 - **Microphone I2S**: Port I2S_NUM_0 (BCK=GPIO8, WS=GPIO10, DATA=GPIO9)  
 - **Speaker I2S**: Port I2S_NUM_1 (BCK=GPIO6, WS=GPIO5, DATA=GPIO7)
-- **Sample Rate**: 16kHz
+- **Sample Rate outgoing**: 16kHz
+- **Sample Rate incoming**: 24kHz
 - **Recording Limit**: 30 seconds max per session
 
 ### Key Constants (main/include/config.h)
-- `SAMPLE_RATE`: 16000 Hz
+- `SAMPLE_RATE OUTGOING`: 16000 Hz
+- `SAMPLE_RATE INCOMING`: 24000 Hz
 - `POST_WAKE_SECONDS`: 30 (max recording length)
 - `KEEP_ALIVE_MS`: 20000 (keep-alive timeout)
 - `MIN_RECORD_SAMPLES`: 16000 (minimum 1-second recording)
