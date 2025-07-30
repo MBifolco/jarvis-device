@@ -21,18 +21,10 @@ static const char *TAG = "audio_rx";
 #define BITS_PER_SAMPLE   16
 #define CHANNELS          1
 
-/* Maximum capture length your app ever sends (seconds) - handle ~17-18 second responses */
-#define MAX_SECONDS       18
-#define DECODE_CHUNK_SIZE (SAMPLE_RATE * 2)  // 2 seconds of PCM for decode buffer
-
-/* StreamBuffer sizing - much smaller than full audio */
-#define MAX_ADPCM_BYTES   (SAMPLE_RATE * CHANNELS * MAX_SECONDS / 2 + 4)  // ~216KB for 18s compressed
+/* StreamBuffer sizing for uncompressed PCM streaming */
 #define STREAM_BUFFER_SECONDS 3  // Only need 3 seconds for BLE smoothing
 #define STREAM_BUFFER_PCM_BYTES (SAMPLE_RATE * CHANNELS * STREAM_BUFFER_SECONDS * 2)  // 3s of PCM
-/* StreamBuffer needs to handle the larger of: full compressed packet OR 3s of uncompressed */
-#define SB_SIZE_BYTES     ((MAX_ADPCM_BYTES > STREAM_BUFFER_PCM_BYTES) ? MAX_ADPCM_BYTES * 2 : STREAM_BUFFER_PCM_BYTES * 2)
-/* Audio processing buffer only needed for compressed (uncompressed streams directly) */
-#define AUDIO_BUF_SIZE    (MAX_ADPCM_BYTES)  // Only for compressed audio buffering
+#define SB_SIZE_BYTES     (STREAM_BUFFER_PCM_BYTES * 2)  // Double buffer for safety
 #define SB_TRIGGER_LEVEL  1
 
 /* debug flag */
@@ -52,8 +44,7 @@ static QueueHandle_t pcm_queue = NULL;
 static int16_t *chunk_pool[CHUNK_POOL_SIZE];
 static bool chunk_pool_used[CHUNK_POOL_SIZE];
 
-/* Dynamic PCM decode buffer - allocated per processing cycle */
-static uint8_t *audio_buf;
+// audio_buf removed - no longer needed for compression
 
 /* PCM chunk for queue */
 typedef struct {
@@ -64,29 +55,13 @@ typedef struct {
 /* prototype */
 static void rx_task(void *arg);
 static void playback_task(void *arg);
-static void process_compressed_audio(uint32_t expected);
 static void process_uncompressed_audio(uint32_t expected);
-static size_t decode_adpcm_block(const uint8_t *in, size_t in_bytes, int16_t *out);
 static void play_pcm_chunk(const int16_t *pcm, size_t nsamps);
 static int16_t* allocate_chunk(void);
 static void free_chunk(int16_t* chunk);
 
 
-// IMA-ADPCM step size table
-static const int step_table[89] = {
-     7,   8,   9,  10,  11,  12,  13,  14,  16,  17,  19,  21,  23,  25,  28,  31,
-    34,  37,  41,  45,  50,  55,  60,  66,  73,  80,  88,  97, 107, 118, 130, 143,
-   157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658,
-   724, 796, 876, 963,1060,1166,1282,1411,1552,1707,1878,2066,2272,2499,2749,3024,
-  3327,3660,4026,4428,4871,5358,5894,6484,7132,7845,8630,9493,10442,11487,12635,13899,
- 15289,16818,18500,20350,22385,24623,27086,29794,32767
-};
-
-// IMA-ADPCM index adjustment table
-static const int index_table[16] = {
-   -1, -1, -1, -1,  2,  4,  6,  8,
-   -1, -1, -1, -1,  2,  4,  6,  8
-};
+// ADPCM lookup tables removed - no longer supporting compression
 
 /**
  * @brief Set up buffers + spawn the RX task.
@@ -118,14 +93,7 @@ esp_err_t audio_rx_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    audio_buf = heap_caps_malloc(AUDIO_BUF_SIZE, MALLOC_CAP_SPIRAM);
-    if (!audio_buf) {
-        ESP_LOGE(TAG, "PSRAM alloc for audio_buf failed");
-        /* cleanup and return ESP_ERR_NO_MEM */
-        heap_caps_free(sb_adpcm_mem);
-        heap_caps_free(sb_adpcm_struct);
-        return ESP_ERR_NO_MEM;
-    }
+    // audio_buf removed - no longer needed for compression
 
     /* 3) Initialize chunk pool to avoid fragmentation */
     for (int i = 0; i < CHUNK_POOL_SIZE; i++) {
@@ -164,7 +132,7 @@ esp_err_t audio_rx_init(void)
     i2s_zero_dma_buffer(I2S_SPK_PORT);
     i2s_set_clk(
         I2S_SPK_PORT,
-        SAMPLE_RATE,      // now 24 kHz again
+        SAMPLE_RATE,      // 24 kHz from OpenAI
         BITS_PER_SAMPLE,
         CHANNELS
     );
@@ -214,126 +182,12 @@ static void rx_task(void *arg)
 
 
 
-        // 2) Check config to determine processing method
-        bool is_compressed = config_get_compress_incoming();
-        
-        if (is_compressed) {
-            // 3) For compressed audio, check size limit since we buffer it all
-            if (expected > MAX_ADPCM_BYTES) {
-                ESP_LOGW(TAG, "Compressed packet too big (%" PRIu32 " > %d), skipping", expected, MAX_ADPCM_BYTES);
-                size_t to_drain = expected;
-                while (to_drain) {
-                    uint8_t tmp[256];
-                    size_t chunk = to_drain > sizeof(tmp) ? sizeof(tmp) : to_drain;
-                    size_t r = xStreamBufferReceive(sb_adpcm, tmp, chunk, portMAX_DELAY);
-                    to_drain -= r;
-                }
-                continue;
-            }
-            process_compressed_audio(expected);
-        } else {
-            // 3) For uncompressed audio, no size limit needed since we stream it
-            process_uncompressed_audio(expected);
-        }
+        // 2) Always process as uncompressed PCM (compression removed)
+        process_uncompressed_audio(expected);
     }
 }
 
-/**
- * @brief Process compressed ADPCM audio - receive all data first, then decode
- */
-static void process_compressed_audio(uint32_t expected)
-{
-    ESP_LOGI(TAG, "Processing compressed ADPCM audio");
-    
-    // Receive all ADPCM data first
-    size_t total_received = 0;
-    while (total_received < expected) {
-        size_t to_read = (expected - total_received > 2048) ? 2048 : (expected - total_received);
-        size_t received = xStreamBufferReceive(
-            sb_adpcm,
-            audio_buf + total_received,
-            to_read,
-            portMAX_DELAY
-        );
-        total_received += received;
-    }
-    
-    // Allocate decode buffer for ADPCM processing
-    int16_t *decode_buf = heap_caps_malloc(DECODE_CHUNK_SIZE * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-    if (!decode_buf) {
-        ESP_LOGE(TAG, "Failed to allocate decode buffer");
-        return;
-    }
-    
-    // Decode ADPCM and queue PCM chunks
-    size_t decode_offset = 0;
-    size_t pcm_accumulated = 0;
-    int chunk_num = 1;
-    const size_t CHUNK_SIZE = SAMPLE_RATE;  // 1 second at 24kHz
-    
-    while (decode_offset + 256 <= expected) {
-        size_t decode_bytes = (expected - decode_offset > 256) ? 256 : (expected - decode_offset);
-        if (decode_bytes >= 4 && pcm_accumulated < DECODE_CHUNK_SIZE) {
-            size_t pcm_decoded = decode_adpcm_block(
-                audio_buf + decode_offset,
-                decode_bytes,
-                decode_buf + pcm_accumulated
-            );
-            pcm_accumulated += pcm_decoded;
-            decode_offset += decode_bytes;
-            
-            // If we have 1 second of PCM, queue it
-            if (pcm_accumulated >= CHUNK_SIZE) {
-                int16_t *chunk_data = heap_caps_malloc(CHUNK_SIZE * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-                if (chunk_data) {
-                    memcpy(chunk_data, decode_buf, CHUNK_SIZE * sizeof(int16_t));
-                    pcm_chunk_t chunk = { .data = chunk_data, .samples = CHUNK_SIZE };
-                    
-                    if (xQueueSend(pcm_queue, &chunk, pdMS_TO_TICKS(100)) == pdTRUE) {
-                        ESP_LOGI(TAG, "Queued ADPCM chunk %d: 1.00 seconds", chunk_num);
-                        // Debug first few ADPCM samples for comparison
-                        for (int i = 0; i < 5 && i < CHUNK_SIZE; i++) {
-                            ESP_LOGI(TAG, "ADPCM sample %d: %d", i+1, chunk_data[i]);
-                        }
-                        chunk_num++;
-                    } else {
-                        ESP_LOGW(TAG, "PCM queue full, dropping ADPCM chunk");
-                        heap_caps_free(chunk_data);
-                        break;
-                    }
-                    
-                    // Shift remaining PCM data
-                    pcm_accumulated -= CHUNK_SIZE;
-                    if (pcm_accumulated > 0) {
-                        memmove(decode_buf, decode_buf + CHUNK_SIZE, pcm_accumulated * sizeof(int16_t));
-                    }
-                }
-            }
-        } else {
-            break;
-        }
-    }
-    
-    // Queue remaining PCM data
-    if (pcm_accumulated > 0) {
-        int16_t *chunk_data = heap_caps_malloc(pcm_accumulated * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-        if (chunk_data) {
-            memcpy(chunk_data, decode_buf, pcm_accumulated * sizeof(int16_t));
-            pcm_chunk_t chunk = { .data = chunk_data, .samples = pcm_accumulated };
-            
-            if (xQueueSend(pcm_queue, &chunk, pdMS_TO_TICKS(100)) == pdTRUE) {
-                ESP_LOGI(TAG, "Final ADPCM chunk %d: %.2f seconds", 
-                        chunk_num, pcm_accumulated / (float)SAMPLE_RATE);
-            } else {
-                ESP_LOGW(TAG, "PCM queue full, dropping final ADPCM chunk");
-                heap_caps_free(chunk_data);
-            }
-        }
-    }
-    
-    heap_caps_free(decode_buf);
-    ESP_LOGI(TAG, "Completed ADPCM decode, total chunks: %d", chunk_num - 1);
-}
+// process_compressed_audio removed - no longer supporting compression
 
 /**
  * @brief Process uncompressed PCM audio - stream and play chunks as data arrives
@@ -385,7 +239,7 @@ static void process_uncompressed_audio(uint32_t expected)
         buffer_used += received;
         
         // Yield more frequently for very long audio to prevent watchdog
-        if (total_received % (SAMPLE_RATE * 10) == 0) {  // Every ~5 seconds
+        if (total_received % (SAMPLE_RATE * 10) == 0) {  // Every ~5 seconds at 24kHz
             vTaskDelay(pdMS_TO_TICKS(5));
         }
         
@@ -482,34 +336,7 @@ static inline int clamp_int(int v, int lo, int hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-static size_t decode_adpcm_block(const uint8_t *in, size_t in_bytes,
-                                 int16_t *out)
-{
-    if (in_bytes < 4) return 0;
-    size_t out_cnt = 0;
-    int16_t pred   = (int16_t)((in[1] << 8) | in[0]);
-    int     idx    = in[2] & 0x7F;
-    out[out_cnt++] = pred;
-
-    size_t i = 4;
-    while (i < in_bytes) {
-        uint8_t b = in[i++];
-        for (int shift = 0; shift <= 4; shift += 4) {
-            int nib  = (b >> shift) & 0x0F;
-            int step = step_table[idx];
-            int diff = step >> 3;
-            if (nib & 1) diff += step >> 2;
-            if (nib & 2) diff += step >> 1;
-            if (nib & 4) diff += step;
-            if (nib & 8) diff = -diff;
-
-            pred = (int16_t)clamp_int(pred + diff, -32768, 32767);
-            idx  = clamp_int(idx + index_table[nib], 0, 88);
-            out[out_cnt++] = pred;
-        }
-    }
-    return out_cnt;
-}
+// decode_adpcm_block removed - no longer supporting compression
 
 static void play_pcm_chunk(const int16_t *pcm, size_t nsamps)
 {
