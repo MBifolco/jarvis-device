@@ -165,134 +165,252 @@ esp_err_t audio_rx_on_write(const uint8_t *data, size_t len)
 static void rx_task(void *arg)
 {
     uint8_t header[4];
+    uint32_t expected = 0;
+    bool have_header = false;
 
+    static uint32_t wait_count = 0;
+    
     for (;;) {
-        // 1) read 4-byte length header
-        xStreamBufferReceive(sb_adpcm, header, 4, portMAX_DELAY);
-        uint32_t expected = ((uint32_t)header[0])
-                          | ((uint32_t)header[1] << 8)
-                          | ((uint32_t)header[2] << 16)
-                          | ((uint32_t)header[3] << 24);
+        // If we don't have a header yet, try to read one
+        if (!have_header) {
+            // 1) Check StreamBuffer has at least 4 bytes available before trying to read header
+            size_t available = xStreamBufferBytesAvailable(sb_adpcm);
+            if (available < 4) {
+                // Only log occasionally to avoid spam during normal idle periods
+                wait_count++;
+                if (wait_count % 500 == 0) {  // Log every 5 seconds when waiting
+                    ESP_LOGI(TAG, "Waiting for audio data... (%u bytes available)", (unsigned)available);
+                }
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            
+            // Reset wait counter when we have data
+            wait_count = 0;
+            
+            // 2) Read 4-byte length header
+            size_t header_received = xStreamBufferReceive(sb_adpcm, header, 4, pdMS_TO_TICKS(100));
+            if (header_received != 4) {
+                ESP_LOGE(TAG, "Failed to read complete header - got %u bytes", (unsigned)header_received);
+                continue;
+            }
+            
+            expected = ((uint32_t)header[0])
+                     | ((uint32_t)header[1] << 8)
+                     | ((uint32_t)header[2] << 16)
+                     | ((uint32_t)header[3] << 24);
 
-        ESP_LOGI(TAG, "RX task: expecting %" PRIu32 " audio bytes", expected);
+            ESP_LOGI(TAG, "RX task: expecting %" PRIu32 " audio bytes", expected);
+            
+            // Log the header bytes for debugging
+            ESP_LOGI(TAG, "Header bytes: [0x%02X, 0x%02X, 0x%02X, 0x%02X]", 
+                    header[0], header[1], header[2], header[3]);
+            
+            have_header = true;  // Mark that we have a valid header
+        }
+
+        // Validate data length is reasonable (valid PCM lengths are typically 48KB-480KB)
+        if (expected > 500000 || expected == 0) {
+            ESP_LOGE(TAG, "Invalid audio length: %" PRIu32 " bytes - header corruption detected!", expected);
+            
+            // Instead of resetting, try to find a valid header by reading byte by byte
+            ESP_LOGI(TAG, "Searching for valid header sync...");
+            bool found_sync = false;
+            int search_attempts = 0;
+            const int MAX_SEARCH_BYTES = 2000; // Don't search forever
+            
+            while (search_attempts < MAX_SEARCH_BYTES && !found_sync) {
+                // Read one byte to advance position
+                uint8_t discard;
+                size_t discarded = xStreamBufferReceive(sb_adpcm, &discard, 1, pdMS_TO_TICKS(10));
+                if (discarded == 0) {
+                    ESP_LOGW(TAG, "No more data during sync search");
+                    break;
+                }
+                search_attempts++;
+                
+                // Check if we have enough bytes for a new header
+                if (xStreamBufferBytesAvailable(sb_adpcm) >= 4) {
+                    // Peek at the next 4 bytes without consuming them
+                    uint8_t peek_header[4];
+                    size_t peeked = xStreamBufferReceive(sb_adpcm, peek_header, 4, pdMS_TO_TICKS(10));
+                    if (peeked == 4) {
+                        uint32_t peek_length = ((uint32_t)peek_header[0])
+                                             | ((uint32_t)peek_header[1] << 8)
+                                             | ((uint32_t)peek_header[2] << 16)
+                                             | ((uint32_t)peek_header[3] << 24);
+                        
+                        // Check if this looks like a valid header (reasonable audio length)
+                        if (peek_length > 1000 && peek_length <= 500000) {
+                            ESP_LOGI(TAG, "Found potential valid header: %" PRIu32 " bytes after skipping %d bytes", 
+                                    peek_length, search_attempts);
+                            // Use this header
+                            memcpy(header, peek_header, 4);
+                            expected = peek_length;
+                            found_sync = true;
+                        } else {
+                            // Put the header back and continue searching
+                            // Reset buffer and put back what we peeked plus what we haven't processed
+                            size_t remaining = xStreamBufferBytesAvailable(sb_adpcm);
+                            uint8_t *temp_buf = malloc(remaining + 4);
+                            if (temp_buf) {
+                                memcpy(temp_buf, peek_header, 4);
+                                if (remaining > 0) {
+                                    xStreamBufferReceive(sb_adpcm, temp_buf + 4, remaining, pdMS_TO_TICKS(100));
+                                }
+                                xStreamBufferReset(sb_adpcm);
+                                xStreamBufferSend(sb_adpcm, temp_buf, remaining + 4, pdMS_TO_TICKS(100));
+                                free(temp_buf);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if (!found_sync) {
+                ESP_LOGE(TAG, "Could not find valid header sync after %d bytes - resetting buffer", search_attempts);
+                xStreamBufferReset(sb_adpcm);
+                have_header = false;  // Reset header state
+                continue;
+            }
+        }
         
-        // Log the header bytes for debugging
-        ESP_LOGI(TAG, "Header bytes: [0x%02X, 0x%02X, 0x%02X, 0x%02X]", 
-                header[0], header[1], header[2], header[3]);
+        // 3) Check that StreamBuffer has enough data for the expected audio
+        size_t available = xStreamBufferBytesAvailable(sb_adpcm);
+        if (available < expected) {
+            ESP_LOGW(TAG, "Not enough data - need %" PRIu32 " bytes, have %u bytes. Waiting...", 
+                    expected, (unsigned)available);
+            
+            // Keep the header but wait for more data
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;  // This will skip reading a new header since have_header is still true
+        }
 
+        ESP_LOGI(TAG, "StreamBuffer ready: %" PRIu32 " bytes needed, %u bytes available", 
+                expected, (unsigned)available);
 
-
-        // 2) Always process as uncompressed PCM (compression removed)
+        // 4) Process as uncompressed PCM (compression removed)
+        ESP_LOGI(TAG, "START processing audio packet: %" PRIu32 " bytes", expected);
+        uint32_t start_time = xTaskGetTickCount();
+        
         process_uncompressed_audio(expected);
+        
+        uint32_t end_time = xTaskGetTickCount();
+        ESP_LOGI(TAG, "FINISHED processing audio packet: took %u ms", 
+                (unsigned)((end_time - start_time) * portTICK_PERIOD_MS));
+        
+        // Reset header state after processing
+        have_header = false;
+        ESP_LOGI(TAG, "Ready for next audio packet");
     }
 }
 
 // process_compressed_audio removed - no longer supporting compression
 
 /**
- * @brief Process uncompressed PCM audio - stream and play chunks as data arrives
+ * @brief Process uncompressed PCM audio - ensure exact byte consumption for StreamBuffer alignment
  */
 static void process_uncompressed_audio(uint32_t expected)
 {
-    ESP_LOGI(TAG, "Streaming uncompressed PCM audio (%d bytes = %.1f seconds)", 
+    ESP_LOGI(TAG, "Processing uncompressed PCM audio (%d bytes = %.1f seconds)", 
              (int)expected, expected / (float)(SAMPLE_RATE * 2));
     
     const size_t CHUNK_BYTES = SAMPLE_RATE * 2;  // 1 second = 48KB at 24kHz 16-bit
-    const size_t BUFFER_SIZE = CHUNK_BYTES * 2;   // 2-second accumulation buffer
     
-    // Allocate accumulation buffer for streaming
-    uint8_t *stream_buffer = heap_caps_malloc(BUFFER_SIZE, MALLOC_CAP_SPIRAM);
-    if (!stream_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate streaming buffer");
-        // Drain data to avoid blocking sender
+    // Read all data in one go to ensure exact consumption
+    uint8_t *audio_data = heap_caps_malloc(expected, MALLOC_CAP_SPIRAM);
+    if (!audio_data) {
+        ESP_LOGE(TAG, "Failed to allocate buffer for %d bytes", (int)expected);
+        // Drain data to avoid blocking sender - must consume exact amount
         uint8_t drain[1024];
         size_t total_drained = 0;
         while (total_drained < expected) {
             size_t to_drain = (expected - total_drained > sizeof(drain)) ? sizeof(drain) : (expected - total_drained);
             size_t drained = xStreamBufferReceive(sb_adpcm, drain, to_drain, portMAX_DELAY);
             total_drained += drained;
+            if (drained == 0) {
+                ESP_LOGE(TAG, "StreamBuffer empty but expected more data!");
+                break;
+            }
         }
+        ESP_LOGI(TAG, "Drained exactly %d bytes (expected %d)", (int)total_drained, (int)expected);
         return;
     }
     
+    // Read exactly the expected number of bytes
     size_t total_received = 0;
-    size_t buffer_used = 0;
-    int chunk_num = 1;
-    bool first_chunk_sent = false;
-    
     while (total_received < expected) {
-        // Receive data into accumulation buffer
-        size_t buffer_space = BUFFER_SIZE - buffer_used;
-        size_t remaining_data = expected - total_received;
-        size_t to_read = (remaining_data > buffer_space) ? buffer_space : remaining_data;
-        
-        if (to_read > 2048) to_read = 2048;  // Receive in reasonable chunks
+        size_t remaining = expected - total_received;
+        size_t to_read = (remaining > 4096) ? 4096 : remaining;  // Read in 4KB chunks max
         
         size_t received = xStreamBufferReceive(
             sb_adpcm,
-            stream_buffer + buffer_used,
+            audio_data + total_received,
             to_read,
             portMAX_DELAY
         );
         
+        if (received == 0) {
+            ESP_LOGE(TAG, "StreamBuffer empty! Received %d/%d bytes", (int)total_received, (int)expected);
+            break;
+        }
+        
         total_received += received;
-        buffer_used += received;
         
-        // Yield more frequently for very long audio to prevent watchdog
-        if (total_received % (SAMPLE_RATE * 10) == 0) {  // Every ~5 seconds at 24kHz
-            vTaskDelay(pdMS_TO_TICKS(5));
-        }
-        
-        // Queue chunks as soon as we have enough data
-        while (buffer_used >= CHUNK_BYTES || (total_received >= expected && buffer_used > 0)) {
-            size_t chunk_bytes = (buffer_used >= CHUNK_BYTES) ? CHUNK_BYTES : buffer_used;
-            size_t chunk_samples = chunk_bytes / sizeof(int16_t);
-            
-            int16_t *chunk_data = allocate_chunk();
-            if (chunk_data && chunk_samples <= SAMPLE_RATE) {
-                memcpy(chunk_data, stream_buffer, chunk_bytes);
-                pcm_chunk_t chunk = { .data = chunk_data, .samples = chunk_samples };
-                
-                if (xQueueSend(pcm_queue, &chunk, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    ESP_LOGI(TAG, "Streamed chunk %d: %.2f seconds (%d/%d bytes received)", 
-                            chunk_num++, chunk_samples / (float)SAMPLE_RATE,
-                            (int)total_received, (int)expected);
-                    
-                    if (!first_chunk_sent) {
-                        ESP_LOGI(TAG, "Playback started while still receiving data");
-                        first_chunk_sent = true;
-                    }
-                } else {
-                    ESP_LOGW(TAG, "PCM queue full, dropping chunk");
-                    heap_caps_free(chunk_data);
-                    break;
-                }
-                
-                // Shift remaining data in buffer
-                buffer_used -= chunk_bytes;
-                if (buffer_used > 0) {
-                    memmove(stream_buffer, stream_buffer + chunk_bytes, buffer_used);
-                }
-                
-                // Yield to prevent watchdog timeout
-                vTaskDelay(pdMS_TO_TICKS(1));
-            } else {
-                ESP_LOGW(TAG, "Chunk pool exhausted - waiting for free chunks");
-                // Shorter wait to minimize audio gaps
-                vTaskDelay(pdMS_TO_TICKS(10));
-                // Don't advance buffer - try again with same data
-            }
-        }
-        
-        // If buffer is full but we can't make a chunk, we have a problem
-        if (buffer_used >= BUFFER_SIZE) {
-            ESP_LOGW(TAG, "Buffer overflow, resetting");
-            buffer_used = 0;
+        // Log progress for long audio
+        if (total_received % (SAMPLE_RATE * 4) == 0) {  // Every ~2 seconds
+            ESP_LOGI(TAG, "Received %d/%d bytes (%.1f%%)", 
+                    (int)total_received, (int)expected, 
+                    100.0f * total_received / expected);
         }
     }
     
-    heap_caps_free(stream_buffer);
-    ESP_LOGI(TAG, "Completed streaming %d chunks (%.1f seconds total)", 
+    ESP_LOGI(TAG, "Read exactly %d bytes from StreamBuffer", (int)total_received);
+    
+    // Verify we got exactly what we expected
+    if (total_received != expected) {
+        ESP_LOGE(TAG, "StreamBuffer misalignment! Expected %d bytes, got %d bytes", 
+                (int)expected, (int)total_received);
+        heap_caps_free(audio_data);
+        return;
+    }
+    
+    // Now process the audio data in chunks for streaming playback
+    size_t offset = 0;
+    int chunk_num = 1;
+    
+    while (offset < total_received) {
+        size_t chunk_bytes = (total_received - offset >= CHUNK_BYTES) ? CHUNK_BYTES : (total_received - offset);
+        size_t chunk_samples = chunk_bytes / sizeof(int16_t);
+        
+        int16_t *chunk_data = allocate_chunk();
+        if (chunk_data && chunk_samples <= SAMPLE_RATE) {
+            memcpy(chunk_data, audio_data + offset, chunk_bytes);
+            pcm_chunk_t chunk = { .data = chunk_data, .samples = chunk_samples };
+            
+            if (xQueueSend(pcm_queue, &chunk, pdMS_TO_TICKS(200)) == pdTRUE) {
+                ESP_LOGI(TAG, "Queued chunk %d: %.2f seconds (%d bytes, offset %d)", 
+                        chunk_num++, chunk_samples / (float)SAMPLE_RATE,
+                        (int)chunk_bytes, (int)offset);
+                offset += chunk_bytes;
+            } else {
+                ESP_LOGW(TAG, "PCM queue full, waiting for space");
+                free_chunk(chunk_data);
+                vTaskDelay(pdMS_TO_TICKS(50));  // Wait longer for queue space
+                // Don't increment offset - try again
+            }
+        } else {
+            ESP_LOGW(TAG, "Chunk pool exhausted - waiting for free chunks");
+            vTaskDelay(pdMS_TO_TICKS(50));
+            // Don't increment offset - try again
+        }
+        
+        // Yield to prevent watchdog timeout
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    
+    heap_caps_free(audio_data);
+    ESP_LOGI(TAG, "Completed processing %d chunks (%.1f seconds total)", 
              chunk_num - 1, expected / (float)(SAMPLE_RATE * 2));
 }
 

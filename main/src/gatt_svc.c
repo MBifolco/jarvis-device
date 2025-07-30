@@ -115,8 +115,15 @@ static int chr_access(uint16_t conn_handle, uint16_t attr_handle,
             size_t len = OS_MBUF_PKTLEN(ctxt->om);
             uint8_t buf[len];
             if (os_mbuf_copydata(ctxt->om, 0, len, buf) == 0) {
+                // Log first few bytes of each BLE write to debug corruption
+                if (len >= 8) {
+                    ESP_LOGI(TAG, "Audio BLE Write %u bytes: [0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X]...", 
+                            (unsigned)len, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
+                } else {
+                    ESP_LOGI(TAG, "Audio BLE Write %u bytes: short packet", (unsigned)len);
+                }
+                
                 audio_rx_on_write(buf, len);
-                ESP_LOGI(TAG, "Audio Characteristic - Wrote %u bytes from phone", (unsigned)len);
                 return 0;
             }
             return 0;
