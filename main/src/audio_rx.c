@@ -30,8 +30,9 @@ bool g_playing_back = false;
 
 /* Reception state machine */
 typedef enum {
-    RX_STATE_WAITING_HEADER,
-    RX_STATE_RECEIVING_AUDIO
+    RX_STATE_WAITING_SYNC,      // Looking for 0xAA 0x55
+    RX_STATE_WAITING_HEADER,     // Reading 4-byte length
+    RX_STATE_RECEIVING_AUDIO     // Receiving audio data
 } rx_state_t;
 
 static struct {
@@ -41,12 +42,14 @@ static struct {
     size_t expected_bytes;      // Expected bytes from header
     uint8_t header_buffer[4];   // Buffer for header bytes
     size_t header_bytes;        // Header bytes received so far
+    uint8_t sync_state;         // 0=looking for 0xAA, 1=looking for 0x55
 } rx_state = {
-    .state = RX_STATE_WAITING_HEADER,
+    .state = RX_STATE_WAITING_SYNC,
     .current_chunk = NULL,
     .bytes_received = 0,
     .expected_bytes = 0,
-    .header_bytes = 0
+    .header_bytes = 0,
+    .sync_state = 0
 };
 
 /* PCM playback queue - sends decoded PCM chunks to playback task */
@@ -113,11 +116,12 @@ esp_err_t audio_rx_init(void)
     );
 
     /* 5) Initialize reception state */
-    rx_state.state = RX_STATE_WAITING_HEADER;
+    rx_state.state = RX_STATE_WAITING_SYNC;
     rx_state.current_chunk = NULL;
     rx_state.bytes_received = 0;
     rx_state.expected_bytes = 0;
     rx_state.header_bytes = 0;
+    rx_state.sync_state = 0;
 
     i2s_zero_dma_buffer(I2S_SPK_PORT);
     i2s_set_clk(
@@ -138,7 +142,25 @@ esp_err_t audio_rx_on_write(const uint8_t *data, size_t len)
     size_t offset = 0;
     
     while (offset < len) {
-        if (rx_state.state == RX_STATE_WAITING_HEADER) {
+        if (rx_state.state == RX_STATE_WAITING_SYNC) {
+            // Look for sync pattern 0xAA 0x55
+            while (offset < len && rx_state.state == RX_STATE_WAITING_SYNC) {
+                uint8_t byte = data[offset++];
+                
+                if (rx_state.sync_state == 0 && byte == 0xAA) {
+                    rx_state.sync_state = 1;
+                } else if (rx_state.sync_state == 1 && byte == 0x55) {
+                    // Found sync pattern!
+                    rx_state.state = RX_STATE_WAITING_HEADER;
+                    rx_state.header_bytes = 0;
+                    rx_state.sync_state = 0;
+                    ESP_LOGD(TAG, "Found sync pattern 0xAA 0x55");
+                } else {
+                    // Reset sync search
+                    rx_state.sync_state = (byte == 0xAA) ? 1 : 0;
+                }
+            }
+        } else if (rx_state.state == RX_STATE_WAITING_HEADER) {
             // Process header bytes one at a time
             while (offset < len && rx_state.header_bytes < 4) {
                 process_header_byte(data[offset++]);
@@ -178,9 +200,10 @@ static void process_header_byte(uint8_t byte)
             (rx_state.expected_bytes < 1000 || rx_state.expected_bytes > 50000)) {
             ESP_LOGE(TAG, "Invalid audio length: %u bytes - expected %d bytes",
                     (unsigned)rx_state.expected_bytes, CHUNK_SIZE_BYTES);
-            // Reset state
-            rx_state.state = RX_STATE_WAITING_HEADER;
+            // Reset state to look for sync again
+            rx_state.state = RX_STATE_WAITING_SYNC;
             rx_state.header_bytes = 0;
+            rx_state.sync_state = 0;
             return;
         }
         
@@ -188,8 +211,9 @@ static void process_header_byte(uint8_t byte)
         rx_state.current_chunk = allocate_chunk();
         if (!rx_state.current_chunk) {
             ESP_LOGE(TAG, "No free chunks available - dropping packet");
-            rx_state.state = RX_STATE_WAITING_HEADER;
+            rx_state.state = RX_STATE_WAITING_SYNC;
             rx_state.header_bytes = 0;
+            rx_state.sync_state = 0;
             return;
         }
         
@@ -207,8 +231,9 @@ static void process_audio_data(const uint8_t *data, size_t len)
 {
     if (!rx_state.current_chunk) {
         ESP_LOGE(TAG, "No current chunk in audio state!");
-        rx_state.state = RX_STATE_WAITING_HEADER;
+        rx_state.state = RX_STATE_WAITING_SYNC;
         rx_state.header_bytes = 0;
+        rx_state.sync_state = 0;
         return;
     }
     
@@ -239,12 +264,13 @@ static void process_audio_data(const uint8_t *data, size_t len)
             free_chunk(rx_state.current_chunk);
         }
         
-        // Reset state for next packet
-        rx_state.state = RX_STATE_WAITING_HEADER;
+        // Reset state for next packet - look for sync pattern
+        rx_state.state = RX_STATE_WAITING_SYNC;
         rx_state.current_chunk = NULL;
         rx_state.bytes_received = 0;
         rx_state.expected_bytes = 0;
         rx_state.header_bytes = 0;
+        rx_state.sync_state = 0;
     }
 }
 
@@ -257,6 +283,9 @@ static void playback_task(void *arg)
     pcm_chunk_t chunk;
     
     ESP_LOGI(TAG, "Playback task started with highest priority");
+    
+    // Don't subscribe this task to watchdog since it legitimately blocks on queue
+    // esp_task_wdt_add(NULL) - NOT calling this
     
     for (;;) {
         // Wait for PCM chunks from rx_task
