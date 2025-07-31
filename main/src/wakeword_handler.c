@@ -23,9 +23,8 @@ void wakeword_handler_handle(
 
     // pause feeding while we switch contexts
     vTaskSuspend(feed_handle);
-    tone_play(1000, 100, 50);
+    tone_play(800, 100, 20);   // Lowered pitch from 1000Hz to 800Hz, volume 20%
     app_ble_notify_wake();
-    tone_play(1500, 80, 60);
 
     // reset the wake-word AFE instance
     info->iface_wake->destroy(info->data_wake);

@@ -13,7 +13,8 @@ This is an ESP32-based voice assistant device called "jarvis-device" that implem
 ### System Integration
 This firmware works in conjunction with a Flutter mobile app located at `../jarvis-app/`. The ESP32 device:
 - Acts as a BLE peripheral that the Flutter app connects to
-- Streams compressed or uncompressed audio data to the mobile app via BLE characteristics
+- Streams compressed audio data from device to app (ADPCM encoded)
+- Receives uncompressed PCM audio from app for playback (24kHz, 16-bit mono)
 - Receives configuration commands from the mobile app
 - Provides real-time status updates (recording state, battery, etc.)
 
@@ -62,8 +63,8 @@ Key flow:
 ### Hardware Configuration
 - **Microphone I2S**: Port I2S_NUM_0 (BCK=GPIO8, WS=GPIO10, DATA=GPIO9)  
 - **Speaker I2S**: Port I2S_NUM_1 (BCK=GPIO6, WS=GPIO5, DATA=GPIO7)
-- **Sample Rate outgoing**: 16kHz
-- **Sample Rate incoming**: 24kHz
+- **Sample Rate outgoing**: 16kHz (recording from microphone)
+- **Sample Rate incoming**: 24kHz (playback from app, matching OpenAI TTS)
 - **Recording Limit**: 30 seconds max per session
 
 ### Key Constants (main/include/config.h)
@@ -84,9 +85,54 @@ The project uses ESP-IDF managed components:
 - `espressif__esp-dsp`: Digital signal processing utilities  
 - `espressif__esp_audio_codec`: Audio encoding/decoding
 
+## Audio Reception Architecture (audio_rx.c)
+
+### Overview
+The audio reception system implements a robust streaming architecture for receiving PCM audio from the Flutter app via BLE:
+
+1. **Direct BLE to Chunk Pool**: No intermediate buffering - BLE data is written directly to pre-allocated audio chunks
+2. **Sync Pattern Protocol**: Uses 0xAA 0x55 sync bytes to reliably detect packet boundaries
+3. **State Machine**: Three states handle sync detection, header parsing, and audio reception
+4. **48KB Chunks**: Each chunk holds exactly 1 second of 24kHz audio (48,000 bytes)
+
+### Key Implementation Details
+
+#### Sync Pattern Protocol
+- Each audio packet starts with sync bytes: `0xAA 0x55`
+- Followed by 4-byte little-endian length header
+- Then raw PCM audio data (24kHz, 16-bit mono)
+- State machine recovers from corruption by searching for next sync pattern
+
+#### Chunk Pool Architecture
+- Pre-allocated pool of 12 chunks (48KB each) in PSRAM
+- Eliminates memory fragmentation from dynamic allocation
+- Chunks are reused via simple allocation/free mechanism
+- Playback task runs at high priority (7) for uninterrupted audio
+
+#### BLE Reception Flow
+```
+BLE Write → State Machine → Header Validation → Direct Copy to Chunk → Queue to Playback
+```
+
+### Critical Configuration
+
+#### Watchdog Settings (sdkconfig)
+- IDLE task watchdog monitoring is DISABLED to prevent audio interruptions
+- `CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0` = not set
+- `CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1` = not set
+- Only critical tasks subscribe to watchdog
+
+#### Task Priorities
+- `audio_play` task: Priority 7 (highest) - ensures smooth playback
+- `feed` task: Priority 5 - audio capture
+- `fetch` task: Priority 5 - AFE processing
+- NimBLE Host: Priority 5 - BLE communication
+
 ## Development Tips
 - Monitor heap usage carefully due to audio buffer allocation
 - Both AFE instances must be properly initialized before use
 - Audio playback (`g_playing_back` flag) pauses audio processing
 - Use `ESP_LOGI` with appropriate tags for debugging different modules
 - The dual-AFE architecture prevents "AEC engine destroyed" errors during instance switching
+- If audio skips occur, check watchdog settings - IDLE tasks should not be monitored
+- The sync pattern (0xAA 0x55) is critical for reliable streaming - do not remove

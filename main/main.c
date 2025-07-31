@@ -56,6 +56,7 @@ static void keep_alive_callback(TimerHandle_t xTimer)
 
     ESP_LOGI(TAG, "Keep-alive expired, disarming");
     keepalive_disable();
+    tone_play(500, 80, 25);   // Lowered pitch from 1500Hz to 1200Hz, volume 25%
 
     if (!info->using_wake) {
         // 1) Flip over to wake pipeline
@@ -158,7 +159,7 @@ void app_main(void)
     keepalive_init();
 
     ESP_LOGI(TAG, "Playing tone to indicate startup");
-    tone_play(1000, 100, 50);
+    
 
     keepAliveTimer = xTimerCreate(
         "keepAlive",
@@ -195,7 +196,8 @@ void app_main(void)
     xTaskCreate(feed_task,  "feed",  8192, &s_info, 5, &feed_handle);
     xTaskCreate(fetch_task, "fetch", 8192, &s_info, 5, NULL);
 
-    tone_play(1000, 100, 50);
+    tone_play(800, 100, 20);  // Lowered volume from 50% to 20%
+    tone_play(1000, 100, 20);  // Lowered volume from 50% to 20%
     ESP_LOGI(TAG, "Ready—say the wake word!");
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));
