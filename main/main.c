@@ -1,4 +1,7 @@
-// main.c — stereo capture with post-wake VAD stop and keep-alive
+// main.c — stereo capture with separate wake-word and post-wake VAD instances
+// Note: Wake instance has AEC disabled to avoid “AEC engine destroyed” errors on destroy.
+//       Hold instance keeps AEC enabled for post-wake recordings.
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +16,8 @@
 #include "esp_afe_sr_models.h"
 #include "driver/i2s.h"
 #include "driver/gpio.h"
+#include <dirent.h>
+#include <sys/stat.h>
 
 #include "esp_nimble_hci.h"
 #include "bluetooth.h"
@@ -20,206 +25,117 @@
 #include "audio_tone.h"
 #include "audio_tx.h"
 #include "audio_rx.h"
+#include "config.h"
+#include "afe_setup.h"
+#include "audio_pipeline.h"
+#include "keepalive.h"
+#include "app_ble.h"
+#include "audio_io.h"  // for audio_io_init()
+#include "task_info.h"
+#include "wakeword_handler.h"
+#include "i2s_setup.h"  // for i2s_mic_init(), i2s_play_init()
+#include "esp_task_wdt.h"  // for watchdog management
 
-static const char *TAG = "wakeword";
-static TaskHandle_t  feed_handle = NULL;
+static const char *TAG          = "wakeword";
+static const char *TAG_WAV      = "wav_player";
+static TaskHandle_t  feed_handle     = NULL;
+static TimerHandle_t keepAliveTimer  = NULL;
 
-// Shared between tasks
-static volatile bool    s_recording     = false;  // armed on wake
-static volatile bool    s_stop_record   = false;  // set by VAD or cap
-static volatile bool    s_seen_speech   = false;  // only stop after some speech
-static volatile bool    s_keep_alive    = false;  // after send, remain ready
-static size_t           s_buf_capacity  = 0;      // in samples
-static size_t           s_buf_filled    = 0;      // in samples
-static int16_t         *s_mono_buf      = NULL;   // PCM buffer
-static TimerHandle_t    keepAliveTimer  = NULL;
+static task_info_t s_info;
 
-// Minimum samples to collect before allowing VAD silence to stop
-#define MIN_RECORD_SAMPLES (SAMPLE_RATE / 1)       // 0.2 seconds at 16 kHz citeturn16file0
-#define KEEP_ALIVE_MS      (20000)                 // 5-second keep-alive window
+// Keep-alive timeout callback
+static void keep_alive_callback(TimerHandle_t xTimer)
+{
+    task_info_t *info = (task_info_t *)pvTimerGetTimerID(xTimer);
 
-typedef struct {
-    esp_afe_sr_iface_t *iface;
-    esp_afe_sr_data_t   *data;
-} task_info_t;
+    if (g_playing_back) {
+        ESP_LOGI(TAG, "Playback in progress, deferring keep-alive");
+        xTimerReset(xTimer, 0);
+        return;
+    }
 
-// ─── HARDWARE & TIMING ─────────────────────────────────────────────────────────
-#define MIC_BCK_IO        GPIO_NUM_5 // SCK purple
-#define MIC_WS_IO         GPIO_NUM_6 // WS green
-#define MIC_DATA_IO       GPIO_NUM_4 // SD orange
-
-#define SPK_BCK_IO        GPIO_NUM_10 // BCK purple
-#define SPK_WS_IO         GPIO_NUM_11 // LRC green
-#define SPK_DATA_IO       GPIO_NUM_9 // DIN orange
-
-#define I2S_MIC_PORT      I2S_NUM_0
-#define I2S_SPK_PORT      I2S_NUM_1
-
-#define SAMPLE_RATE       16000
-#define POST_WAKE_SECONDS 30         // max record length
-// ────────────────────────────────────────────────────────────────────────────────
-
-static void keep_alive_callback(TimerHandle_t xTimer) {
     ESP_LOGI(TAG, "Keep-alive expired, disarming");
-    s_keep_alive = false;
+    keepalive_disable();
+
+    if (!info->using_wake) {
+        // 1) Flip over to wake pipeline
+        info->iface      = info->iface_wake;
+        info->data       = info->data_wake;
+        info->using_wake = true;
+
+        // 2) Now safe to tear down & rebuild the hold instance
+        info->iface_hold->destroy(info->data_hold);
+        info->data_hold = info->iface_hold->create_from_config(info->cfg_hold);
+ 
+        ESP_LOGI(TAG, "Switched back to wake-word VAD after keep-alive");
+    }
 }
 
-static void i2s_mic_init(void)
-{
-    i2s_config_t cfg = {
-        .mode                = I2S_MODE_MASTER | I2S_MODE_RX,
-        .sample_rate         = SAMPLE_RATE,
-        .bits_per_sample     = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format      = I2S_CHANNEL_FMT_RIGHT_LEFT,
-        .communication_format= I2S_COMM_FORMAT_I2S,
-        .intr_alloc_flags    = 0,
-        .dma_buf_count       = 4,
-        .dma_buf_len         = 512,
-        .use_apll            = false,
-        .tx_desc_auto_clear  = false,
-        .fixed_mclk          = 0
-    };
-    i2s_pin_config_t pins = {
-        .bck_io_num   = MIC_BCK_IO,
-        .ws_io_num    = MIC_WS_IO,
-        .data_out_num = I2S_PIN_NO_CHANGE,
-        .data_in_num  = MIC_DATA_IO
-    };
-    ESP_ERROR_CHECK(i2s_driver_install(I2S_MIC_PORT, &cfg, 0, NULL));
-    ESP_ERROR_CHECK(i2s_set_pin(I2S_MIC_PORT, &pins));
-    ESP_LOGI(TAG, "I2S RX inited");
-}
 
-static void i2s_play_init(void)
-{
-    i2s_config_t cfg = {
-        .mode                = I2S_MODE_MASTER | I2S_MODE_TX,
-        .sample_rate         = SAMPLE_RATE,
-        .bits_per_sample     = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format      = I2S_CHANNEL_FMT_ONLY_LEFT,
-        .communication_format= I2S_COMM_FORMAT_I2S,
-        .intr_alloc_flags    = 0,
-        .dma_buf_count       = 4,
-        .dma_buf_len         = 512,
-        .use_apll            = false,
-        .tx_desc_auto_clear  = true,
-        .fixed_mclk          = 0
-    };
-    i2s_pin_config_t pins = {
-        .bck_io_num   = SPK_BCK_IO,
-        .ws_io_num    = SPK_WS_IO,
-        .data_out_num = SPK_DATA_IO,
-        .data_in_num  = I2S_PIN_NO_CHANGE
-    };
-    ESP_ERROR_CHECK(i2s_driver_install(I2S_SPK_PORT, &cfg, 0, NULL));
-    ESP_ERROR_CHECK(i2s_set_pin(I2S_SPK_PORT, &pins));
-    ESP_LOGI(TAG, "I2S TX inited");
-}
+// ────────────────────────────────────────────────────────────────────────────────
 
 static void feed_task(void *arg)
 {
-    task_info_t *info = arg;
-    int  chunksize = info->iface->get_feed_chunksize(info->data);
-    int  channels  = info->iface->get_feed_channel_num(info->data);
+    task_info_t *info  = (task_info_t *)arg;
+    int  chunksize     = info->iface->get_feed_chunksize(info->data);
+    int  channels      = info->iface->get_feed_channel_num(info->data);
     size_t frame_bytes = chunksize * channels * sizeof(int16_t);
-    int16_t *i2s_buf = malloc(frame_bytes);
-
-    s_buf_capacity = POST_WAKE_SECONDS * SAMPLE_RATE;
+    
+    // Allocate I2S buffer on stack to avoid memory leak
+    int16_t i2s_buf[chunksize * channels];
 
     ESP_LOGI(TAG, "feed_task started (chunk=%d, channels=%d)", chunksize, channels);
+    
+    // Subscribe to watchdog - this task should run regularly
+    esp_task_wdt_add(NULL);
     while (1) {
+        // Feed watchdog once per loop iteration
+        esp_task_wdt_reset();
+        
         if (g_playing_back) {
+            vTaskDelay(pdMS_TO_TICKS(1));
             continue;
         }
-        
+
         size_t read_bytes;
         if (i2s_read(I2S_MIC_PORT, i2s_buf, frame_bytes, &read_bytes, portMAX_DELAY) != ESP_OK) {
             ESP_LOGW(TAG, "I2S read failed");
             continue;
         }
 
-        // 1) feed AFE for wake/VAD
-        info->iface->feed(info->data, i2s_buf);
+        // 1) Feed, buffer, and send in one call
+        audio_pipeline_process_chunk(
+            info->iface,
+            info->data,
+            i2s_buf,
+            read_bytes,
+            channels,
+            keepAliveTimer
+        );
 
-        // 2) capture if armed or in keep-alive
-        if ((s_recording || s_keep_alive) && !s_stop_record && s_mono_buf) {
-            size_t frames = read_bytes / (channels * sizeof(int16_t));
-            for (size_t i = 0; i < frames && s_buf_filled < s_buf_capacity; i++) {
-                s_mono_buf[s_buf_filled++] = i2s_buf[i * channels];
-            }
-        }
-
-        // 3) stop on VAD or cap
-        if (s_recording && (s_stop_record || s_buf_filled >= s_buf_capacity)) {
-            ESP_LOGI(TAG, "Sending %u samples (%.2f s)…",
-                     (unsigned)s_buf_filled,
-                     s_buf_filled / (float)SAMPLE_RATE);
-
-            audio_tx_send((const uint8_t*)s_mono_buf,
-                          s_buf_filled * sizeof(int16_t));
-
-            free(s_mono_buf);
-            s_mono_buf    = NULL;
-            s_recording   = false;
-            s_seen_speech = false;
-            s_buf_filled  = 0;
-            // start keep-alive
-            s_keep_alive = true;
-            xTimerReset(keepAliveTimer, 0);
-        }
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
 static void fetch_task(void *arg)
 {
-    task_info_t *info = arg;
+    task_info_t *info = (task_info_t *)arg;
     afe_fetch_result_t *res;
+    
+    ESP_LOGI(TAG, "fetch_task started");
+    
+    // Don't subscribe to watchdog - fetch might legitimately have nothing to process
+    // esp_task_wdt_add(NULL) - NOT calling this
 
     while (1) {
         while ((res = info->iface->fetch(info->data)) != NULL) {
-            // 1) Wake word → arm record immediately
-            if (res->wakeup_state == WAKENET_DETECTED) {
-                ESP_LOGI(TAG, "Wake word detected!");
-                xTimerStop(keepAliveTimer, 0);
-                s_keep_alive   = false;
-
-                vTaskSuspend(feed_handle);
-                tone_play(1000, 100, 50);
-                gatt_svc_notify_wake();
-                tone_play(1500, 80, 60);
-                vTaskResume(feed_handle);
-
-                // alloc & arm
-                s_mono_buf    = malloc(s_buf_capacity * sizeof(int16_t));
-                s_buf_filled  = 0;
-                s_stop_record = false;
-                s_recording   = true;
-                s_seen_speech = false;
-                ESP_LOGI(TAG, "Recording up to %d seconds…", POST_WAKE_SECONDS);
+            // 1) Wake word → arm record
+            if (res->wakeup_state == WAKENET_DETECTED && info->using_wake) {
+                wakeword_handler_handle(info, feed_handle, keepAliveTimer);
             }
 
-            // 2) VAD logic
-            if ((s_recording || s_keep_alive) && res->wakeup_state != WAKENET_DETECTED) {
-                if (res->vad_state) {
-                    s_seen_speech = true;
-                    // on new speech in keep-alive, re-arm full record
-                    if (s_keep_alive && !s_recording) {
-                        xTimerStop(keepAliveTimer, 0);
-                        s_keep_alive  = false;
-                        s_mono_buf    = malloc(s_buf_capacity * sizeof(int16_t));
-                        s_buf_filled  = 0;
-                        s_stop_record = false;
-                        s_recording   = true;
-                        s_seen_speech = true;
-                        ESP_LOGI(TAG, "Re-armed recording during keep-alive");
-                    }
-                } else if (!res->vad_state) {
-                    if (s_recording && s_seen_speech && s_buf_filled > MIN_RECORD_SAMPLES) {
-                        ESP_LOGI(TAG, "VAD silence → stopping (samples=%u)", (unsigned)s_buf_filled);
-                        s_stop_record = true;
-                    }
-                }
-            }
+            // 2) VAD logic during hold (now in audio_pipeline module)
+            audio_pipeline_handle_vad(res, keepAliveTimer);
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
@@ -232,32 +148,54 @@ void app_main(void)
     i2s_play_init();
     tone_set_i2s_port(I2S_SPK_PORT);
 
+    config_init();
     bluetooth_init();
-    audio_rx_init();
-    audio_tx_compression_init();
+    app_ble_init();
+    audio_io_init();
 
-    // create keep-alive timer
+    // ← initialize audio_pipeline once
+    audio_pipeline_init(POST_WAKE_SECONDS * SAMPLE_RATE);
+    keepalive_init();
+
+    ESP_LOGI(TAG, "Playing tone to indicate startup");
+    tone_play(1000, 100, 50);
+
     keepAliveTimer = xTimerCreate(
         "keepAlive",
         pdMS_TO_TICKS(KEEP_ALIVE_MS),
         pdFALSE,
-        NULL,
+        (void *)&s_info,
         keep_alive_callback
     );
-
-    // AFE + WakeNet + VAD
+    
+    // Initialize AFE/WakeNet models
     srmodel_list_t *models = esp_srmodel_init("model");
-    afe_config_t   *cfg    = afe_config_init("MR", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
-    cfg->wakenet_init = true;
-    cfg->vad_init     = true;
 
-    esp_afe_sr_iface_t *iface = esp_afe_handle_from_config(cfg);
-    esp_afe_sr_data_t   *data  = iface->create_from_config(cfg);
+    // A) Wake-word AFE/VAD
+    afe_config_t *cfg_wake = create_wake_afe(models);
+    esp_afe_sr_iface_t *iface_wake = esp_afe_handle_from_config(cfg_wake);
+    esp_afe_sr_data_t   *data_wake  = iface_wake->create_from_config(cfg_wake);
 
-    task_info_t info = { .iface = iface, .data = data };
-    xTaskCreate(feed_task,  "feed",  4096, &info, 5, &feed_handle);
-    xTaskCreate(fetch_task, "fetch", 4096, &info, 5, NULL);
+    // B) Post-wake AFE/VAD
+    afe_config_t *cfg_hold = create_hold_afe(models);
+    esp_afe_sr_iface_t *iface_hold = esp_afe_handle_from_config(cfg_hold);
+    esp_afe_sr_data_t   *data_hold  = iface_hold->create_from_config(cfg_hold);
 
+    // Populate global info struct
+    s_info.cfg_wake    = cfg_wake;
+    s_info.cfg_hold    = cfg_hold;
+    s_info.iface_wake  = iface_wake;
+    s_info.data_wake   = data_wake;
+    s_info.iface_hold  = iface_hold;
+    s_info.data_hold   = data_hold;
+    s_info.iface       = iface_wake;
+    s_info.data        = data_wake;
+    s_info.using_wake  = true;
+
+    xTaskCreate(feed_task,  "feed",  8192, &s_info, 5, &feed_handle);
+    xTaskCreate(fetch_task, "fetch", 8192, &s_info, 5, NULL);
+
+    tone_play(1000, 100, 50);
     ESP_LOGI(TAG, "Ready—say the wake word!");
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));

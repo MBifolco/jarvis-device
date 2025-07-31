@@ -2,188 +2,389 @@
    SPDX-License-Identifier: Unlicense OR CC0-1.0 */
 
 #include "audio_rx.h"
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-#include <stddef.h>
-#include <inttypes.h>
+#include "config.h"
 #include "esp_log.h"
 #include "driver/i2s.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_heap_caps.h"    // for MALLOC_CAP_SPIRAM
+#include <stdlib.h>
+#include <string.h>
+#include <inttypes.h>
 
 static const char *TAG = "audio_rx";
 
-// I²S configuration — must match your encoding sample rate
+/* I2S + PCM parameters */
 #define I2S_SPK_PORT      I2S_NUM_1
 #define SAMPLE_RATE       24000
 #define BITS_PER_SAMPLE   16
 #define CHANNELS          1
 
-// Max duration we expect (seconds) × rate × channels
-#define MAX_SECONDS       10
-#define MAX_SAMPLES       (SAMPLE_RATE * MAX_SECONDS)
+/* Chunk size matching app (48KB = 1 second at 24kHz) */
+#define CHUNK_SIZE_BYTES  48000
+#define CHUNK_SIZE_SAMPLES (CHUNK_SIZE_BYTES / sizeof(int16_t))
 
-// Global flag set true while playing back the buffered PCM
+/* debug flag */
 bool g_playing_back = false;
 
-// ADPCM framing state
-static uint32_t adpcm_expected = 0;
-static uint32_t adpcm_received = 0;
-static bool     header_parsed  = false;
+/* Reception state machine */
+typedef enum {
+    RX_STATE_WAITING_SYNC,      // Looking for 0xAA 0x55
+    RX_STATE_WAITING_HEADER,     // Reading 4-byte length
+    RX_STATE_RECEIVING_AUDIO     // Receiving audio data
+} rx_state_t;
 
-// Buffers
-static uint8_t  *adpcm_buffer = NULL;     // incoming ADPCM stream
-static int16_t  *pcm_accum    = NULL;     // decoded PCM
-static size_t    pcm_filled   = 0;
-
-// IMA-ADPCM tables
-static const int step_table[89] = {
-     7,   8,   9,  10,  11,  12,  13,  14,  16,  17,  19,  21,  23,  25,  28,  31,
-    34,  37,  41,  45,  50,  55,  60,  66,  73,  80,  88,  97, 107, 118, 130, 143,
-   157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658,
-   724, 796, 876, 963,1060,1166,1282,1411,1552,1707,1878,2066,2272,2499,2749,3024,
-  3327,3660,4026,4428,4871,5358,5894,6484,7132,7845,8630,9493,10442,11487,12635,13899,
- 15289,16818,18500,20350,22385,24623,27086,29794,32767
+static struct {
+    rx_state_t state;
+    int16_t* current_chunk;     // Current chunk being filled by BLE
+    size_t bytes_received;      // Bytes received in current chunk
+    size_t expected_bytes;      // Expected bytes from header
+    uint8_t header_buffer[4];   // Buffer for header bytes
+    size_t header_bytes;        // Header bytes received so far
+    uint8_t sync_state;         // 0=looking for 0xAA, 1=looking for 0x55
+} rx_state = {
+    .state = RX_STATE_WAITING_SYNC,
+    .current_chunk = NULL,
+    .bytes_received = 0,
+    .expected_bytes = 0,
+    .header_bytes = 0,
+    .sync_state = 0
 };
-static const int index_table[16] = {
-   -1, -1, -1, -1, 2, 4, 6, 8,
-   -1, -1, -1, -1, 2, 4, 6, 8
-};
 
-// Read 32-bit little-endian length header
-static uint32_t read_le32(const uint8_t *p) {
-    return ((uint32_t)p[0]) |
-           ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) |
-           ((uint32_t)p[3] << 24);
-}
+/* PCM playback queue - sends decoded PCM chunks to playback task */
+static QueueHandle_t pcm_queue = NULL;
 
-static inline int clamp_int(int v, int lo, int hi) {
-    return v < lo ? lo : (v > hi ? hi : v);
-}
+/* Pre-allocated chunk pool to avoid fragmentation */
+#define CHUNK_POOL_SIZE 12  // 12 chunks of 48KB each
+static int16_t *chunk_pool[CHUNK_POOL_SIZE];
+static bool chunk_pool_used[CHUNK_POOL_SIZE];
+static SemaphoreHandle_t chunk_pool_mutex = NULL;
 
-// Decode one 256-byte (or smaller) ADPCM block → PCM samples
-static size_t decode_adpcm_block(const uint8_t *in, size_t in_bytes,
-                                 int16_t *out)
+/* PCM chunk for queue */
+typedef struct {
+    int16_t *data;
+    size_t samples;
+} pcm_chunk_t;
+
+/* prototype */
+static void playback_task(void *arg);
+static void play_pcm_chunk(const int16_t *pcm, size_t nsamps);
+static int16_t* allocate_chunk(void);
+static void free_chunk(int16_t* chunk);
+static void process_header_byte(uint8_t byte);
+static void process_audio_data(const uint8_t *data, size_t len);
+
+/**
+ * @brief Set up buffers + spawn the playback task.
+ */
+esp_err_t audio_rx_init(void)
 {
-    if (in_bytes < 4) return 0;
-    size_t out_cnt = 0;
+    /* 1) Create mutex for chunk pool access */
+    chunk_pool_mutex = xSemaphoreCreateMutex();
+    if (!chunk_pool_mutex) {
+        ESP_LOGE(TAG, "Failed to create chunk pool mutex");
+        return ESP_ERR_NO_MEM;
+    }
 
-    const int16_t gate_threshold = 0;  // tweak this up or down
+    /* 2) Initialize chunk pool with 48KB chunks */
+    for (int i = 0; i < CHUNK_POOL_SIZE; i++) {
+        chunk_pool[i] = heap_caps_malloc(CHUNK_SIZE_BYTES, MALLOC_CAP_SPIRAM);
+        if (!chunk_pool[i]) {
+            ESP_LOGE(TAG, "Failed to allocate chunk pool entry %d", i);
+            // Free already allocated chunks
+            for (int j = 0; j < i; j++) {
+                heap_caps_free(chunk_pool[j]);
+            }
+            return ESP_ERR_NO_MEM;
+        }
+        chunk_pool_used[i] = false;
+    }
+    ESP_LOGI(TAG, "Allocated chunk pool: %d chunks x %d bytes each", CHUNK_POOL_SIZE, CHUNK_SIZE_BYTES);
 
-    int16_t pred = (int16_t)((in[1] << 8) | in[0]);
-    int     idx  = in[2] & 0x7F;
-    out[out_cnt++] = (abs(pred) < gate_threshold) ? 0 : pred;;
+    /* 3) Create PCM queue for sending chunks to playback task */
+    pcm_queue = xQueueCreate(CHUNK_POOL_SIZE, sizeof(pcm_chunk_t));
+    if (!pcm_queue) {
+        ESP_LOGE(TAG, "Failed to create PCM queue");
+        return ESP_ERR_NO_MEM;
+    }
 
-    size_t i = 4;
-    while (i < in_bytes) {
-        uint8_t b = in[i++];
-        for (int shift = 0; shift <= 4; shift += 4) {
-            int nib  = (b >> shift) & 0x0F;
-            int step = step_table[idx];
-            int diff = step >> 3;
-            if (nib & 1) diff += step >> 2;
-            if (nib & 2) diff += step >> 1;
-            if (nib & 4) diff += step;
-            if (nib & 8) diff = -diff;
+    /* 4) Start the playback task - highest priority for uninterrupted I2S writes */
+    xTaskCreate(
+        playback_task, "audio_play", 4096,
+        NULL, 7, NULL  // Highest priority 7
+    );
 
-            pred = (int16_t)clamp_int(pred + diff, -32768, 32767);
-            idx  = clamp_int(idx + index_table[nib], 0, 88);
-            out[out_cnt++] = (abs(pred) < gate_threshold) ? 0 : pred;;
+    /* 5) Initialize reception state */
+    rx_state.state = RX_STATE_WAITING_SYNC;
+    rx_state.current_chunk = NULL;
+    rx_state.bytes_received = 0;
+    rx_state.expected_bytes = 0;
+    rx_state.header_bytes = 0;
+    rx_state.sync_state = 0;
+
+    i2s_zero_dma_buffer(I2S_SPK_PORT);
+    i2s_set_clk(
+        I2S_SPK_PORT,
+        SAMPLE_RATE,      // 24 kHz from OpenAI
+        BITS_PER_SAMPLE,
+        CHANNELS
+    );
+
+    return ESP_OK;
+}
+
+/**
+ * @brief Handle BLE data - state machine processes header/audio directly
+ */
+esp_err_t audio_rx_on_write(const uint8_t *data, size_t len)
+{
+    size_t offset = 0;
+    
+    while (offset < len) {
+        if (rx_state.state == RX_STATE_WAITING_SYNC) {
+            // Look for sync pattern 0xAA 0x55
+            while (offset < len && rx_state.state == RX_STATE_WAITING_SYNC) {
+                uint8_t byte = data[offset++];
+                
+                if (rx_state.sync_state == 0 && byte == 0xAA) {
+                    rx_state.sync_state = 1;
+                } else if (rx_state.sync_state == 1 && byte == 0x55) {
+                    // Found sync pattern!
+                    rx_state.state = RX_STATE_WAITING_HEADER;
+                    rx_state.header_bytes = 0;
+                    rx_state.sync_state = 0;
+                    ESP_LOGD(TAG, "Found sync pattern 0xAA 0x55");
+                } else {
+                    // Reset sync search
+                    rx_state.sync_state = (byte == 0xAA) ? 1 : 0;
+                }
+            }
+        } else if (rx_state.state == RX_STATE_WAITING_HEADER) {
+            // Process header bytes one at a time
+            while (offset < len && rx_state.header_bytes < 4) {
+                process_header_byte(data[offset++]);
+            }
+        } else if (rx_state.state == RX_STATE_RECEIVING_AUDIO) {
+            // Process audio data
+            size_t remaining = len - offset;
+            process_audio_data(&data[offset], remaining);
+            offset += remaining;
         }
     }
-    return out_cnt;
+    
+    return ESP_OK;
 }
 
-// Initialize decoder state, buffers and I²S
-void audio_rx_init(void)
+/**
+ * @brief Process a single header byte
+ */
+static void process_header_byte(uint8_t byte)
 {
-    header_parsed  = false;
-    adpcm_expected = 0;
-    adpcm_received = 0;
-    pcm_filled     = 0;
-
-    free(adpcm_buffer);
-    adpcm_buffer = NULL;
-
-    free(pcm_accum);
-    pcm_accum = malloc(sizeof(int16_t) * MAX_SAMPLES);
-
-    // configure I²S TX
-    i2s_zero_dma_buffer(I2S_SPK_PORT);
-    i2s_set_clk(I2S_SPK_PORT, SAMPLE_RATE, BITS_PER_SAMPLE, CHANNELS);
+    rx_state.header_buffer[rx_state.header_bytes++] = byte;
+    
+    if (rx_state.header_bytes == 4) {
+        // Parse complete header
+        rx_state.expected_bytes = ((uint32_t)rx_state.header_buffer[0])
+                                | ((uint32_t)rx_state.header_buffer[1] << 8)
+                                | ((uint32_t)rx_state.header_buffer[2] << 16)
+                                | ((uint32_t)rx_state.header_buffer[3] << 24);
+        
+        ESP_LOGI(TAG, "Received header: [0x%02X, 0x%02X, 0x%02X, 0x%02X] = %u bytes",
+                rx_state.header_buffer[0], rx_state.header_buffer[1],
+                rx_state.header_buffer[2], rx_state.header_buffer[3],
+                (unsigned)rx_state.expected_bytes);
+        
+        // Validate expected size (48KB chunks)
+        if (rx_state.expected_bytes != CHUNK_SIZE_BYTES &&
+            (rx_state.expected_bytes < 1000 || rx_state.expected_bytes > 50000)) {
+            ESP_LOGE(TAG, "Invalid audio length: %u bytes - expected %d bytes",
+                    (unsigned)rx_state.expected_bytes, CHUNK_SIZE_BYTES);
+            // Reset state to look for sync again
+            rx_state.state = RX_STATE_WAITING_SYNC;
+            rx_state.header_bytes = 0;
+            rx_state.sync_state = 0;
+            return;
+        }
+        
+        // Allocate chunk for audio data
+        rx_state.current_chunk = allocate_chunk();
+        if (!rx_state.current_chunk) {
+            ESP_LOGE(TAG, "No free chunks available - dropping packet");
+            rx_state.state = RX_STATE_WAITING_SYNC;
+            rx_state.header_bytes = 0;
+            rx_state.sync_state = 0;
+            return;
+        }
+        
+        // Transition to receiving audio
+        rx_state.state = RX_STATE_RECEIVING_AUDIO;
+        rx_state.bytes_received = 0;
+        ESP_LOGI(TAG, "Ready to receive %u bytes of audio data", (unsigned)rx_state.expected_bytes);
+    }
 }
 
-// Playback the entire decoded PCM at once
-void audio_rx_playback(void)
+/**
+ * @brief Process audio data bytes
+ */
+static void process_audio_data(const uint8_t *data, size_t len)
 {
-    if (pcm_filled == 0) return;
+    if (!rx_state.current_chunk) {
+        ESP_LOGE(TAG, "No current chunk in audio state!");
+        rx_state.state = RX_STATE_WAITING_SYNC;
+        rx_state.header_bytes = 0;
+        rx_state.sync_state = 0;
+        return;
+    }
+    
+    // Calculate how much data we can copy
+    size_t remaining_in_chunk = rx_state.expected_bytes - rx_state.bytes_received;
+    size_t to_copy = (len < remaining_in_chunk) ? len : remaining_in_chunk;
+    
+    // Copy data directly to chunk as int16_t samples
+    uint8_t *dest = ((uint8_t*)rx_state.current_chunk) + rx_state.bytes_received;
+    memcpy(dest, data, to_copy);
+    rx_state.bytes_received += to_copy;
+    
+    ESP_LOGD(TAG, "Received %u bytes, total %u/%u", 
+            (unsigned)to_copy, (unsigned)rx_state.bytes_received, (unsigned)rx_state.expected_bytes);
+    
+    // Check if chunk is complete
+    if (rx_state.bytes_received >= rx_state.expected_bytes) {
+        ESP_LOGI(TAG, "Audio chunk complete: %u bytes", (unsigned)rx_state.bytes_received);
+        
+        // Queue chunk for playback
+        pcm_chunk_t chunk = {
+            .data = rx_state.current_chunk,
+            .samples = rx_state.bytes_received / sizeof(int16_t)
+        };
+        
+        if (xQueueSend(pcm_queue, &chunk, pdMS_TO_TICKS(100)) != pdTRUE) {
+            ESP_LOGW(TAG, "PCM queue full - dropping chunk");
+            free_chunk(rx_state.current_chunk);
+        }
+        
+        // Reset state for next packet - look for sync pattern
+        rx_state.state = RX_STATE_WAITING_SYNC;
+        rx_state.current_chunk = NULL;
+        rx_state.bytes_received = 0;
+        rx_state.expected_bytes = 0;
+        rx_state.header_bytes = 0;
+        rx_state.sync_state = 0;
+    }
+}
+
+/**
+ * @brief Dedicated playback task - highest priority, only does I2S writes
+ * This task runs with highest priority to prevent any interruptions during playback
+ */
+static void playback_task(void *arg)
+{
+    pcm_chunk_t chunk;
+    
+    ESP_LOGI(TAG, "Playback task started with highest priority");
+    
+    // Don't subscribe this task to watchdog since it legitimately blocks on queue
+    // esp_task_wdt_add(NULL) - NOT calling this
+    
+    for (;;) {
+        // Wait for PCM chunks from rx_task
+        if (xQueueReceive(pcm_queue, &chunk, portMAX_DELAY) == pdTRUE) {
+            ESP_LOGI(TAG, "Playing PCM chunk: %d samples (%.2f seconds)", 
+                     chunk.samples, chunk.samples / (float)SAMPLE_RATE);
+            
+            // Set flag to prevent recording during playback
+            g_playing_back = true;
+            
+            // Play the chunk with dedicated I2S writing
+            play_pcm_chunk(chunk.data, chunk.samples);
+            
+            // Return chunk to pool
+            free_chunk(chunk.data);
+            
+            // Clear flag when done
+            g_playing_back = false;
+        }
+    }
+}
+
+/*———————————————————————————————*
+ |  I2S writer                    |
+ *———————————————————————————————*/
+
+static void play_pcm_chunk(const int16_t *pcm, size_t nsamps)
+{
     g_playing_back = true;
 
+    const uint8_t *data       = (const uint8_t*)pcm;
+    size_t         total_bytes = nsamps * sizeof(int16_t);
+    size_t         offset      = 0;
+    const size_t   CHUNK       = 1024;  // 1 KB - smaller chunks for better flow control
 
-    ESP_LOGI(TAG, "Playing back %zu samples", pcm_filled);
-    size_t written = 0;
-    i2s_write(I2S_SPK_PORT,
-              pcm_accum,
-              pcm_filled * sizeof(int16_t),
-              &written,
-              portMAX_DELAY);
-    ESP_LOGI(TAG, "I2S wrote %zu bytes", written);
-
-    // reset state
-    pcm_filled     = 0;
-    header_parsed  = false;
-    adpcm_expected = 0;
-    adpcm_received = 0;
-    free(adpcm_buffer);
-    adpcm_buffer = NULL;
+    while (offset < total_bytes) {
+        size_t to_write = (total_bytes - offset > CHUNK)
+                            ? CHUNK
+                            : (total_bytes - offset);
+        size_t written = 0;
+        esp_err_t err = i2s_write(
+            I2S_SPK_PORT,
+            data + offset,
+            to_write,
+            &written,
+            pdMS_TO_TICKS(100)     // longer timeout for DMA buffer to drain
+        );
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "i2s_write error: %s", esp_err_to_name(err));
+            break;
+        }
+        if (written < to_write) {
+            ESP_LOGW(TAG, "i2s_write wrote only %u/%u bytes",
+                     (unsigned)written, (unsigned)to_write);
+        }
+        offset += written;
+        // yield so BLE/VAD tasks don't starve
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
 
     g_playing_back = false;
 }
 
-// Called on each BLE write chunk
-void audio_rx_on_write(const uint8_t *data, size_t len)
+/**
+ * @brief Allocate a chunk from the pre-allocated pool
+ */
+static int16_t* allocate_chunk(void)
 {
-    size_t offset = 0;
-
-    // 1) parse 4-byte length header
-    if (!header_parsed) {
-        if (len < 4) {
-            return;  // wait for full header
+    int16_t* chunk = NULL;
+    
+    if (xSemaphoreTake(chunk_pool_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        for (int i = 0; i < CHUNK_POOL_SIZE; i++) {
+            if (!chunk_pool_used[i]) {
+                chunk_pool_used[i] = true;
+                chunk = chunk_pool[i];
+                break;
+            }
         }
-        adpcm_expected = read_le32(data);
-        header_parsed  = true;
-        adpcm_received = 0;
-        pcm_filled     = 0;
-
-        free(adpcm_buffer);
-        adpcm_buffer = malloc(adpcm_expected);
-
-        offset = 4;
-        ESP_LOGI(TAG, "Expecting %" PRIu32 " ADPCM bytes", adpcm_expected);
+        xSemaphoreGive(chunk_pool_mutex);
     }
+    
+    return chunk;
+}
 
-    // 2) buffer this chunk
-    size_t chunk = len - offset;
-    if (adpcm_received + chunk > adpcm_expected) {
-        chunk = adpcm_expected - adpcm_received;
-    }
-    memcpy(adpcm_buffer + adpcm_received, data + offset, chunk);
-    adpcm_received += chunk;
-
-    ESP_LOGD(TAG,
-             "Received %" PRIu32 "/%" PRIu32 " ADPCM bytes",
-             adpcm_received, adpcm_expected);
-
-    // 3) once we have it all, decode & play
-    if (adpcm_received >= adpcm_expected) {
-        size_t in_off = 0;
-        while (in_off < adpcm_expected) {
-            size_t blk = (adpcm_expected - in_off >= 256) ? 256 : (adpcm_expected - in_off);
-            size_t got = decode_adpcm_block(adpcm_buffer + in_off, blk,
-                                            pcm_accum + pcm_filled);
-            pcm_filled += got;
-            in_off    += blk;
+/**
+ * @brief Return a chunk to the pool
+ */
+static void free_chunk(int16_t* chunk)
+{
+    if (xSemaphoreTake(chunk_pool_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        for (int i = 0; i < CHUNK_POOL_SIZE; i++) {
+            if (chunk_pool[i] == chunk) {
+                chunk_pool_used[i] = false;
+                xSemaphoreGive(chunk_pool_mutex);
+                return;
+            }
         }
-        audio_rx_playback();
+        xSemaphoreGive(chunk_pool_mutex);
+        // Should never happen - log error
+        ESP_LOGE(TAG, "Attempted to free unknown chunk %p", chunk);
     }
 }

@@ -23,6 +23,9 @@ extern uint16_t audio_notify_handle;
 /** Handle of our write characteristic (phone → device) */
 extern uint16_t audio_write_handle;
 
+/** Handle of our config characteristic (phone → device) */
+extern uint16_t config_ctrl_handle;
+
 /* Public function declarations */
 void gatt_svr_register_cb(struct ble_gatt_register_ctxt *ctxt, void *arg);
 void gatt_svr_subscribe_cb(struct ble_gap_event *event);

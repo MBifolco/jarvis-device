@@ -1,4 +1,5 @@
 #include "audio_tone.h"
+#include "esp_heap_caps.h"
 #include <math.h>
 #include <stdlib.h>
 
@@ -15,7 +16,7 @@ esp_err_t tone_play(uint32_t freq_hz, uint32_t ms, uint8_t vol) {
     }
 
     int total_samples = (SAMPLE_RATE * ms) / 1000;
-    int16_t *buf = malloc(sizeof(int16_t) * total_samples);
+    int16_t *buf = heap_caps_malloc(sizeof(int16_t) * total_samples, MALLOC_CAP_DEFAULT);
     if (!buf) return ESP_ERR_NO_MEM;
 
     const double phase_inc = 2.0 * M_PI * freq_hz / SAMPLE_RATE;
@@ -33,6 +34,6 @@ esp_err_t tone_play(uint32_t freq_hz, uint32_t ms, uint8_t vol) {
       portMAX_DELAY
     );
 
-    free(buf);
+    heap_caps_free(buf);
     return err;
 }
