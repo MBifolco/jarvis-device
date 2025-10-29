@@ -7,6 +7,9 @@
 #include "esp_audio_enc_reg.h"
 #include "esp_audio_enc.h"
 #include "esp_adpcm_enc.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -14,6 +17,16 @@
 #define TAG "audio_tx"
 #define BLE_CHUNK_SIZE 497
 #define WAV_HEADER_SIZE 46
+#define TX_QUEUE_SIZE 1  // Simple conversation flow - one recording at a time
+
+// Structure for queuing transmission jobs
+typedef struct {
+    uint8_t *pcm_data;
+    size_t len;
+} tx_job_t;
+
+static TaskHandle_t tx_task_handle = NULL;
+static QueueHandle_t tx_queue = NULL;
 
 
 static esp_audio_enc_handle_t enc_handle = NULL;
@@ -91,168 +104,242 @@ esp_err_t audio_tx_compression_init(void)
     return ESP_OK;
 }
 
-esp_err_t audio_tx_send(const uint8_t *pcm, size_t len)
+// Background task that handles audio compression and BLE transmission
+static void tx_task(void *arg)
 {
-    if (!chr_conn_handle || !audio_notify_handle) {
-        ESP_LOGW(TAG, "No active BLE connection or audio handle");
-        return ESP_FAIL;
-    }
+    tx_job_t job;
 
-    const uint8_t *input_ptr = pcm;
-    size_t input_remaining = len;
+    ESP_LOGI(TAG, "Transmission task started");
 
-    uint8_t *inbuf = malloc(in_frame_size);
-    uint8_t *outbuf = malloc(out_frame_size);
-    if (!inbuf || !outbuf) {
-        ESP_LOGE(TAG, "Failed to allocate compression buffers");
-        heap_caps_free(inbuf); heap_caps_free(outbuf);
-        return ESP_ERR_NO_MEM;
-    }
-
-    // Use smaller streaming buffer instead of allocating full size
-    const size_t STREAM_BUF_SIZE = 8192;  // 8KB streaming buffer
-    uint8_t *adpcm_stream_buf = malloc(STREAM_BUF_SIZE);
-    if (!adpcm_stream_buf) {
-        ESP_LOGE(TAG, "Failed to allocate ADPCM streaming buffer");
-        heap_caps_free(inbuf); heap_caps_free(outbuf);
-        return ESP_ERR_NO_MEM;
-    }
-
-    // First pass: calculate total ADPCM size for header
-    size_t total_adpcm_size = 0;
-    const uint8_t *calc_ptr = pcm;
-    size_t calc_remaining = len;
-    while (calc_remaining >= in_frame_size) {
-        total_adpcm_size += out_frame_size;
-        calc_ptr += in_frame_size;
-        calc_remaining -= in_frame_size;
-    }
-
-    // Send header first
-    uint8_t header[WAV_HEADER_SIZE] = {0};
-    build_adpcm_wav_header(header, total_adpcm_size);
-    ESP_LOGI(TAG, "Sending ADPCM WAV header for %d bytes", (int)total_adpcm_size);
-    
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(header, WAV_HEADER_SIZE);
-    if (!om) {
-        ESP_LOGE(TAG, "Failed to allocate BLE buffer for header");
-        goto cleanup;
-    }
-    int rc = ble_gatts_notify_custom(chr_conn_handle, audio_notify_handle, om);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "Failed to notify WAV header; rc=%d", rc);
-        goto cleanup;
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    // Stream compression and transmission
-    size_t stream_offset = 0;
-    size_t total_sent = 0;
-    
-    while (input_remaining >= in_frame_size) {
-        memcpy(inbuf, input_ptr, in_frame_size);
-        input_ptr += in_frame_size;
-        input_remaining -= in_frame_size;
-
-        esp_audio_enc_in_frame_t in_frame = {
-            .buffer = inbuf,
-            .len = in_frame_size,
-        };
-
-        esp_audio_enc_out_frame_t out_frame = {
-            .buffer = outbuf,
-            .len = out_frame_size,
-        };
-
-        esp_err_t err = esp_audio_enc_process(enc_handle, &in_frame, &out_frame);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "ADPCM encoding failed: %s", esp_err_to_name(err));
-            break;
+    while (1) {
+        // Wait for a transmission job
+        if (xQueueReceive(tx_queue, &job, portMAX_DELAY) != pdTRUE) {
+            continue;
         }
 
-        // Add to streaming buffer
-        if (stream_offset + out_frame.len > STREAM_BUF_SIZE) {
-            // Send current buffer
+        ESP_LOGI(TAG, "Processing transmission job: %d bytes PCM", (int)job.len);
+
+        if (!chr_conn_handle || !audio_notify_handle) {
+            ESP_LOGW(TAG, "No active BLE connection or audio handle, dropping job");
+            free(job.pcm_data);
+            continue;
+        }
+
+        const uint8_t *input_ptr = job.pcm_data;
+        size_t input_remaining = job.len;
+
+        uint8_t *inbuf = malloc(in_frame_size);
+        uint8_t *outbuf = malloc(out_frame_size);
+        if (!inbuf || !outbuf) {
+            ESP_LOGE(TAG, "Failed to allocate compression buffers");
+            heap_caps_free(inbuf);
+            heap_caps_free(outbuf);
+            free(job.pcm_data);
+            continue;
+        }
+
+        const size_t STREAM_BUF_SIZE = 8192;
+        uint8_t *adpcm_stream_buf = malloc(STREAM_BUF_SIZE);
+        if (!adpcm_stream_buf) {
+            ESP_LOGE(TAG, "Failed to allocate ADPCM streaming buffer");
+            heap_caps_free(inbuf);
+            heap_caps_free(outbuf);
+            free(job.pcm_data);
+            continue;
+        }
+
+        // Calculate total ADPCM size for header
+        size_t total_adpcm_size = 0;
+        const uint8_t *calc_ptr = job.pcm_data;
+        size_t calc_remaining = job.len;
+        while (calc_remaining >= in_frame_size) {
+            total_adpcm_size += out_frame_size;
+            calc_ptr += in_frame_size;
+            calc_remaining -= in_frame_size;
+        }
+
+        // Send header first
+        uint8_t header[WAV_HEADER_SIZE] = {0};
+        build_adpcm_wav_header(header, total_adpcm_size);
+        ESP_LOGI(TAG, "Sending ADPCM WAV header for %d bytes", (int)total_adpcm_size);
+
+        struct os_mbuf *om = ble_hs_mbuf_from_flat(header, WAV_HEADER_SIZE);
+        if (!om) {
+            ESP_LOGE(TAG, "Failed to allocate BLE buffer for header");
+            goto cleanup;
+        }
+        int rc = ble_gatts_notify_custom(chr_conn_handle, audio_notify_handle, om);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "Failed to notify WAV header; rc=%d", rc);
+            goto cleanup;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        // Stream compression and transmission
+        size_t stream_offset = 0;
+        size_t total_sent = 0;
+
+        while (input_remaining >= in_frame_size) {
+            memcpy(inbuf, input_ptr, in_frame_size);
+            input_ptr += in_frame_size;
+            input_remaining -= in_frame_size;
+
+            esp_audio_enc_in_frame_t in_frame = {
+                .buffer = inbuf,
+                .len = in_frame_size,
+            };
+
+            esp_audio_enc_out_frame_t out_frame = {
+                .buffer = outbuf,
+                .len = out_frame_size,
+            };
+
+            esp_err_t err = esp_audio_enc_process(enc_handle, &in_frame, &out_frame);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "ADPCM encoding failed: %s", esp_err_to_name(err));
+                break;
+            }
+
+            // Add to streaming buffer
+            if (stream_offset + out_frame.len > STREAM_BUF_SIZE) {
+                size_t send_offset = 0;
+                while (send_offset < stream_offset) {
+                    size_t chunk_len = (stream_offset - send_offset > BLE_CHUNK_SIZE)
+                                       ? BLE_CHUNK_SIZE : (stream_offset - send_offset);
+
+                    int retry_count = 0;
+                    om = NULL;
+                    while (!om && retry_count < 5) {
+                        om = ble_hs_mbuf_from_flat(adpcm_stream_buf + send_offset, chunk_len);
+                        if (!om) {
+                            ESP_LOGW(TAG, "BLE buffer allocation failed, retry %d/5", retry_count + 1);
+                            vTaskDelay(pdMS_TO_TICKS(50));
+                            retry_count++;
+                        }
+                    }
+
+                    if (!om) {
+                        ESP_LOGE(TAG, "Failed to allocate BLE buffer after retries");
+                        goto cleanup;
+                    }
+
+                    rc = ble_gatts_notify_custom(chr_conn_handle, audio_notify_handle, om);
+                    if (rc != 0) {
+                        ESP_LOGE(TAG, "Failed to notify chunk; rc=%d", rc);
+                        goto cleanup;
+                    }
+
+                    send_offset += chunk_len;
+                    total_sent += chunk_len;
+                    vTaskDelay(pdMS_TO_TICKS(80));
+                }
+                stream_offset = 0;
+            }
+
+            memcpy(adpcm_stream_buf + stream_offset, outbuf, out_frame.len);
+            stream_offset += out_frame.len;
+        }
+
+        // Send remaining data
+        if (stream_offset > 0) {
             size_t send_offset = 0;
             while (send_offset < stream_offset) {
-                size_t chunk_len = (stream_offset - send_offset > BLE_CHUNK_SIZE) 
+                size_t chunk_len = (stream_offset - send_offset > BLE_CHUNK_SIZE)
                                    ? BLE_CHUNK_SIZE : (stream_offset - send_offset);
-                
-                // Retry BLE buffer allocation with backoff
+
                 int retry_count = 0;
                 om = NULL;
                 while (!om && retry_count < 5) {
                     om = ble_hs_mbuf_from_flat(adpcm_stream_buf + send_offset, chunk_len);
                     if (!om) {
-                        ESP_LOGW(TAG, "BLE buffer allocation failed, retry %d/5", retry_count + 1);
-                        vTaskDelay(pdMS_TO_TICKS(50));  // Wait for buffers to free up
+                        ESP_LOGW(TAG, "BLE buffer allocation failed (final), retry %d/5", retry_count + 1);
+                        vTaskDelay(pdMS_TO_TICKS(50));
                         retry_count++;
                     }
                 }
-                
+
                 if (!om) {
-                    ESP_LOGE(TAG, "Failed to allocate BLE buffer after retries");
-                    goto cleanup;
+                    ESP_LOGE(TAG, "Failed to allocate BLE buffer for final chunk");
+                    break;
                 }
-                
+
                 rc = ble_gatts_notify_custom(chr_conn_handle, audio_notify_handle, om);
                 if (rc != 0) {
-                    ESP_LOGE(TAG, "Failed to notify chunk; rc=%d", rc);
-                    goto cleanup;
+                    ESP_LOGE(TAG, "Failed to notify final chunk; rc=%d", rc);
+                    break;
                 }
-                
+
                 send_offset += chunk_len;
                 total_sent += chunk_len;
-                vTaskDelay(pdMS_TO_TICKS(80));  // Increased delay to prevent buffer exhaustion
+                vTaskDelay(pdMS_TO_TICKS(80));
             }
-            stream_offset = 0;  // Reset buffer
         }
-        
-        memcpy(adpcm_stream_buf + stream_offset, outbuf, out_frame.len);
-        stream_offset += out_frame.len;
-    }
 
-    // Send remaining data in buffer
-    if (stream_offset > 0) {
-        size_t send_offset = 0;
-        while (send_offset < stream_offset) {
-            size_t chunk_len = (stream_offset - send_offset > BLE_CHUNK_SIZE) 
-                               ? BLE_CHUNK_SIZE : (stream_offset - send_offset);
-            
-            // Retry BLE buffer allocation with backoff
-            int retry_count = 0;
-            om = NULL;
-            while (!om && retry_count < 5) {
-                om = ble_hs_mbuf_from_flat(adpcm_stream_buf + send_offset, chunk_len);
-                if (!om) {
-                    ESP_LOGW(TAG, "BLE buffer allocation failed (final), retry %d/5", retry_count + 1);
-                    vTaskDelay(pdMS_TO_TICKS(50));  // Wait for buffers to free up
-                    retry_count++;
-                }
-            }
-            
-            if (!om) {
-                ESP_LOGE(TAG, "Failed to allocate BLE buffer for final chunk");
-                break;
-            }
-            
-            rc = ble_gatts_notify_custom(chr_conn_handle, audio_notify_handle, om);
-            if (rc != 0) {
-                ESP_LOGE(TAG, "Failed to notify final chunk; rc=%d", rc);
-                break;
-            }
-            
-            send_offset += chunk_len;
-            total_sent += chunk_len;
-            vTaskDelay(pdMS_TO_TICKS(80));  // Increased delay to prevent buffer exhaustion
-        }
-    }
-
-    ESP_LOGI(TAG, "Audio transmission complete (ADPCM, %d bytes total)", (int)(total_sent + WAV_HEADER_SIZE));
+        ESP_LOGI(TAG, "Audio transmission complete (ADPCM, %d bytes total)", (int)(total_sent + WAV_HEADER_SIZE));
 
 cleanup:
-    heap_caps_free(inbuf);
-    heap_caps_free(outbuf);
-    heap_caps_free(adpcm_stream_buf);
+        heap_caps_free(inbuf);
+        heap_caps_free(outbuf);
+        heap_caps_free(adpcm_stream_buf);
+        free(job.pcm_data);
+    }
+}
+
+esp_err_t audio_tx_task_init(void)
+{
+    tx_queue = xQueueCreate(TX_QUEUE_SIZE, sizeof(tx_job_t));
+    if (tx_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create transmission queue");
+        return ESP_FAIL;
+    }
+
+    BaseType_t ret = xTaskCreate(
+        tx_task,
+        "audio_tx",
+        4096,
+        NULL,
+        5,
+        &tx_task_handle
+    );
+
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create transmission task");
+        vQueueDelete(tx_queue);
+        tx_queue = NULL;
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Transmission task initialized (queue size: %d)", TX_QUEUE_SIZE);
+    return ESP_OK;
+}
+
+esp_err_t audio_tx_send(const uint8_t *pcm, size_t len)
+{
+    if (tx_queue == NULL) {
+        ESP_LOGE(TAG, "Transmission queue not initialized");
+        return ESP_FAIL;
+    }
+
+    // Copy PCM data for background task (will be freed by tx_task)
+    uint8_t *pcm_copy = malloc(len);
+    if (pcm_copy == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate memory for PCM copy");
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(pcm_copy, pcm, len);
+
+    // Create job and queue it
+    tx_job_t job = {
+        .pcm_data = pcm_copy,
+        .len = len
+    };
+
+    if (xQueueSend(tx_queue, &job, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGW(TAG, "Failed to queue transmission job (queue full)");
+        free(pcm_copy);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Queued transmission job: %d bytes PCM", (int)len);
     return ESP_OK;
 }

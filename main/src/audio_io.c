@@ -12,4 +12,7 @@ void audio_io_init(void)
 
     ESP_LOGI(TAG, "Initializing audio TX compression");
     audio_tx_compression_init();
+
+    ESP_LOGI(TAG, "Initializing audio TX task");
+    audio_tx_task_init();
 }
