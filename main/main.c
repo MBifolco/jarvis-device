@@ -86,13 +86,13 @@ static void feed_task(void *arg)
     int16_t i2s_buf[chunksize * channels];
 
     ESP_LOGI(TAG, "feed_task started (chunk=%d, channels=%d)", chunksize, channels);
-    
+
     // Subscribe to watchdog - this task should run regularly
     esp_task_wdt_add(NULL);
     while (1) {
         // Feed watchdog once per loop iteration
         esp_task_wdt_reset();
-        
+
         if (g_playing_back) {
             vTaskDelay(pdMS_TO_TICKS(1));
             continue;
