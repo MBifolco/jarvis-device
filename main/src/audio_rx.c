@@ -111,7 +111,7 @@ esp_err_t audio_rx_init(void)
 
     /* 4) Start the playback task - highest priority for uninterrupted I2S writes */
     xTaskCreate(
-        playback_task, "audio_play", 4096,
+        playback_task, "audio_play", 8192,  // Increased from 4096 for I2S driver calls
         NULL, 7, NULL  // Highest priority 7
     );
 
@@ -295,13 +295,13 @@ static void playback_task(void *arg)
             
             // Set flag to prevent recording during playback
             g_playing_back = true;
-            
+
             // Play the chunk with dedicated I2S writing
             play_pcm_chunk(chunk.data, chunk.samples);
-            
+
             // Return chunk to pool
             free_chunk(chunk.data);
-            
+
             // Clear flag when done
             g_playing_back = false;
         }
